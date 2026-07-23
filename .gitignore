@@ -1,0 +1,5 @@
+Manifest.toml
+/.CondaPkg/
+*.cov
+/docs/build/
+.DS_Store

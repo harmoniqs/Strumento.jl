@@ -156,34 +156,38 @@ end
         pyimport("strumento")
     catch e
         @info "skipping: Python `strumento` not importable in this environment ($e)"
-        return
+        nothing
     end
-    fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
-    board = pyimport("strumento.core.mock").MockQickSocV2.from_snapshot(
-        joinpath(fixtures, "_fixtures", "soccfg_v2_testbench.json"))
-    dev = st.Device.load(joinpath(fixtures, "loopback_demo", "device.yaml"))
+    if st === nothing
+        @test true   # vacuous pass: the pure-Julia CI lane carries no Python strumento
+    else
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        board = pyimport("strumento.core.mock").MockQickSocV2.from_snapshot(
+            joinpath(fixtures, "_fixtures", "soccfg_v2_testbench.json"))
+        dev = st.Device.load(joinpath(fixtures, "loopback_demo", "device.yaml"))
 
-    # a small smooth pulse on one drive, sized in the testbench gen's REAL clocking:
-    # f_fabric 599.04 MHz with samps_per_clk 16 → envelopes need ≥48 samples to clear
-    # qick's 3-fabric-cycle minimum. T = 0.3 µs at 599.04 samples/µs → 180 samples.
-    times = collect(range(0.0, 0.3, length = 180))
-    pulse = LinearSplinePulse(0.05 .* sin.(range(0, π, length = 180))', times)
-    cmap = QickChannelMap([QickGenChannel(0, 5e3; i_drive = 1)]; n_drives = 1)
-    soc = StrumentoSoc(dev; drive_map = [(1, "qubit", "drive", 4000.0)],
-                       dac_rate = 599.04, adc_rate = 599.04, board = board)
+        # a small smooth pulse on one drive, sized in the testbench gen's REAL clocking:
+        # f_fabric 599.04 MHz with samps_per_clk 16 → envelopes need ≥48 samples to clear
+        # qick's 3-fabric-cycle minimum. T = 0.3 µs at 599.04 samples/µs → 180 samples.
+        times = collect(range(0.0, 0.3, length = 180))
+        pulse = LinearSplinePulse(0.05 .* sin.(range(0, π, length = 180))', times)
+        cmap = QickChannelMap([QickGenChannel(0, 5e3; i_drive = 1)]; n_drives = 1)
+        soc = StrumentoSoc(dev; drive_map = [(1, "qubit", "drive", 4000.0)],
+                           dac_rate = 599.04, adc_rate = 599.04, board = board)
 
-    blobs = execute!(soc, pulse, cmap, [180])   # final knot only
-    @test length(blobs) == 1
-    @test length(blobs[1]) == 1
-    @test isfinite(real(blobs[1][1])) && isfinite(imag(blobs[1][1]))
-    # MockQickSocV2 yields zero-valued IQ: the assertion that matters is that the
-    # pipeline produced a SHAPED single-read result — i.e. the Measure op made the
-    # compiler declare a readout channel, and acquire returned through it.
-    @test blobs[1][1] == 0.0 + 0.0im
+        blobs = execute!(soc, pulse, cmap, [180])   # final knot only
+        @test length(blobs) == 1
+        @test length(blobs[1]) == 1
+        @test isfinite(real(blobs[1][1])) && isfinite(imag(blobs[1][1]))
+        # MockQickSocV2 yields zero-valued IQ: the assertion that matters is that the
+        # pipeline produced a SHAPED single-read result — i.e. the Measure op made the
+        # compiler declare a readout channel, and acquire returned through it.
+        @test blobs[1][1] == 0.0 + 0.0im
 
-    # per-knot truncation: two knots on the same pulse produce two acquisitions
-    blobs2 = execute!(soc, pulse, cmap, [90, 180])
-    @test length(blobs2) == 2
-    # knot 1 (t=0) is refused loudly on the delegated path
-    @test_throws ErrorException execute!(soc, pulse, cmap, [1])
+        # per-knot truncation: two knots on the same pulse produce two acquisitions
+        blobs2 = execute!(soc, pulse, cmap, [90, 180])
+        @test length(blobs2) == 2
+        # knot 1 (t=0) is refused loudly on the delegated path
+        @test_throws ErrorException execute!(soc, pulse, cmap, [1])
+    end
 end

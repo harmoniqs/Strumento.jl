@@ -28,3 +28,13 @@ jobs:
       # suite (PyQickSoc is not constructed in CI).
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - uses: julia-actions/julia-processcoverage@v1
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - uses: codecov/codecov-action@v7
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

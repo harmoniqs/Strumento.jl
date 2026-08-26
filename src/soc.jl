@@ -40,6 +40,9 @@ adc_rate(soc::AbstractSoc) =
     struct _BareSoc <: Strumento.AbstractSoc end
     s = _BareSoc()
     @test_throws ErrorException load_envelope!(s, 0, [1.0], [0.0])
+    @test_throws ErrorException play_program!(s)
     @test_throws ErrorException acquire(s, [0])
+    @test_throws ErrorException adc_rate(s)
     @test_throws ErrorException dac_rate(s)
+    @test_throws ErrorException execute!(s, 0)
 end

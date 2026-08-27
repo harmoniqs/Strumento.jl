@@ -21,7 +21,10 @@ pulse is handed to `strumento.from_solution` and run through a `StrumentoProgram
 board — Julia never assembles the program.
 
 `strumento` (and `qick`) are imported lazily here; an actionable error is raised if the
-Python package is unavailable. Hardware-only — not run in CI.
+Python package is unavailable. The delegation path is exercised end-to-end against the
+Python-side mock (`MockQickSocV2`) by a test that runs when Python + strumento are
+importable and skips cleanly otherwise — the pure-Julia CI lane stays pure. Real-board
+acquisition remains a collaboration session.
 """
 mutable struct StrumentoSoc <: AbstractSoc
     strumento::Py          # the imported `strumento` module
@@ -54,6 +57,14 @@ adc_rate(soc::StrumentoSoc) = soc.adc_rate
 
 # execute! — hand the pulse to Python `strumento` (from_solution → program → acquire →
 # reduce). This replaces the old inline-qick-assembly stub: strumento owns translation.
+#
+# Knot semantics (the AbstractSoc contract; see MockSoc): `indices` are MeasurementModel
+# knots into 1:N, and each knot's blob must be the IQ measured AT that knot's time. The
+# delegated path honors that with ONE PROGRAM PER KNOT: the pulse is handed to
+# `from_solution` TRUNCATED at the knot (`times[1:k]`, `controls[:, 1:k]`), a `Measure` op
+# is appended (`from_solution` plays pulses only — the compiler declares readout channels
+# only when it sees one), the program compiles and acquires, and the averaged IQ becomes
+# that knot's blob. The old placeholder (repeat the final average per index) is gone.
 function execute!(soc::StrumentoSoc, pulse::AbstractPulse, ::QickChannelMap,
                   indices::Vector{Int})
     T = duration(pulse)
@@ -61,40 +72,70 @@ function execute!(soc::StrumentoSoc, pulse::AbstractPulse, ::QickChannelMap,
     times = collect(range(0.0, T, length = nsamp))
     ctrls = sample(pulse, times)                       # (n_drives, nsamp)
 
-    # Build strumento's solution dict {times, controls: {line_name: samples}} and a
-    # drive_map {line_name: (LineRef(line, role), carrier_mhz)}.
     LineRef = soc.strumento.LineRef
-    controls = pydict()
     py_drive_map = pydict()
     for (d, line, role, carrier) in soc.drive_map
-        controls[line] = pylist(ctrls[d, :])
         py_drive_map[line] = pytuple((LineRef(line, role), carrier))
     end
-    solution = pydict(["times" => pylist(times), "controls" => controls])
 
-    seq = soc.strumento.from_solution(solution; drive_map = py_drive_map,
-                                      gain_calib = _gain_calib(soc), dac_rate = soc.dac_rate)
     StrumentoProgram = pyimport("strumento.core.program").StrumentoProgram
-    prog = StrumentoProgram(soc.device; seq = seq, soc = soc.board)
-    result = prog.acquire(soc.board; progress = false)
+    from_solution = pyimport("strumento.core.pulses").from_solution
+    gain_calib = _pi_pulse_reference(soc)
 
-    # Reduce to per-index IQ blobs. The concrete reduce (readout-kind projection →
-    # measurement vectors keyed by knot index) is finalized with the collaboration;
-    # here we surface the averaged I/Q the result carries.
-    return _result_to_blobs(result, indices)
+    blobs = Vector{Vector{ComplexF64}}(undef, length(indices))
+    for (j, k) in enumerate(indices)
+        (2 ≤ k ≤ nsamp) || error("StrumentoSoc.execute!: knot index $k outside the " *
+            "playable pulse ($nsamp samples); knot 1 (t=0, before any evolution) has no " *
+            "delegated readout — the mock path owns that case")
+        knot_solution = pydict([
+            "times" => pylist(times[1:k]),
+            "controls" => pydict([line => pylist(ctrls[d, 1:k])
+                                  for (d, line, role, _) in soc.drive_map]),
+        ])
+        seq = from_solution(knot_solution; drive_map = py_drive_map,
+                            gain_calib = gain_calib, dac_rate = soc.dac_rate)
+        seq.measure()   # pulses-only seq compiles with no readout channels otherwise
+        prog = StrumentoProgram(soc.device; seq = seq, soc = soc.board)
+        result = prog.acquire(soc.board, progress = false)
+        blobs[j] = [_averaged_iq(result)]
+    end
+    return blobs
 end
 
-# The physical-amplitude → v2-fraction reference strumento's from_solution needs. On a
-# real device this comes from an amplitude-Rabi calibration (a strumento PiPulseReference);
-# supplied by the collaboration's device config. Placeholder identity until then.
-_gain_calib(::StrumentoSoc) = pyimport("strumento.packs.cqed.calibration").PiPulseReference(
-    pi_gain_frac = 1.0, pi_rabi_mhz = 1.0)
+# The physical-amplitude → v2-fraction reference `from_solution` needs (issue #2): read
+# from the loaded device's own calibration, never a Julia-supplied constant.
+#
+# The gain FRACTION comes from the device's own factory (`dev.qubit.ge_pi()`): Python owns
+# the D23 int-code → fraction conversion and the soccfg `maxv` resolution (TransmonOps'
+# `_maxv` walks the wiring), so this side never re-implements them. The Rabi rate uses the
+# mean-rate convention from the stored π-pulse timing: a π rotation over the played window
+# gives Ω/2π = 0.5 / T_π (MHz). This fixes a LINEAR ruler (frac per MHz) — exact for
+# pulses of the calibration pulse's shape class; the shape-exact reference (peak-Rabi for
+# the imported envelope's window) is a hardware-session refinement with the collaboration.
+function _pi_pulse_reference(soc::StrumentoSoc)
+    pi_pulse = soc.device.qubit.ge_pi()
+    gain_frac = pyconvert(Float64, pi_pulse.gain)
+    pc = soc.device.calib.qubit.pulses["pi_ge"]
+    length_us = pyconvert(Float64, pc.length)
+    sigma_us = pyconvert(Float64, pc.sigma)
+    T_pi = length_us > 0 ? length_us : 6 * sigma_us   # gauss: played window ≈ 6σ
+    T_pi > 0 || error("StrumentoSoc: the calibration π pulse has no usable duration " *
+                      "(length=$length_us µs, sigma=$sigma_us µs)")
+    return pyimport("strumento.packs.cqed.calibration").PiPulseReference(
+        pi_gain_frac = gain_frac, pi_rabi_mhz = 0.5 / T_pi)
+end
 
-function _result_to_blobs(result::Py, indices::Vector{Int})
-    avgi = pyconvert(Vector{Float64}, result.avgi)
-    avgq = pyconvert(Vector{Float64}, result.avgq)
-    # one blob per requested knot index (the collaboration finalizes multi-knot readout)
-    return [ComplexF64.(avgi) .+ im .* ComplexF64.(avgq) for _ in indices]
+# A single readout channel's averaged acquisition → one IQ sample. With no swept axis the
+# result is 1-D — shape (n_reads,) = (1,) on this path; the readout channel exists because
+# `Measure` was appended (its absence fails earlier, at compile). astype first: the
+# acquisition may carry float32 (the ADC's native width), which pyconvert will not widen.
+function _averaged_iq(result::Py)
+    np = pyimport("numpy")
+    avgi = pyconvert(Vector{Float64}, np.asarray(result.avgi, dtype = "float64").reshape(-1))
+    avgq = pyconvert(Vector{Float64}, np.asarray(result.avgq, dtype = "float64").reshape(-1))
+    length(avgi) == 1 || error("StrumentoSoc: expected a single averaged readout, got " *
+                               "avgi with $(length(avgi)) entries")
+    return ComplexF64(avgi[1], avgq[1])
 end
 
 @testitem "StrumentoSoc is an AbstractSoc (type only; no Python/board in CI)" begin
@@ -103,4 +144,50 @@ end
     # Not constructed here: that needs the Python `strumento` package + a board, and
     # would initialize PythonCall's interpreter. The delegation path is validated by
     # the collaboration on hardware.
+end
+
+@testitem "StrumentoSoc delegation runs end-to-end on the Python mock (skips without Python strumento)" begin
+    using Strumento
+    using PythonCall
+    # Embedded-Python hygiene: a bare interpreter (no shell locale) defaults to ASCII and
+    # chokes on the µ/– in device YAMLs — force UTF-8 mode before the interpreter starts.
+    ENV["PYTHONUTF8"] = "1"
+    st = try
+        pyimport("strumento")
+    catch e
+        @info "skipping: Python `strumento` not importable in this environment ($e)"
+        nothing
+    end
+    if st === nothing
+        @test true   # vacuous pass: the pure-Julia CI lane carries no Python strumento
+    else
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        board = pyimport("strumento.core.mock").MockQickSocV2.from_snapshot(
+            joinpath(fixtures, "_fixtures", "soccfg_v2_testbench.json"))
+        dev = st.Device.load(joinpath(fixtures, "loopback_demo", "device.yaml"))
+
+        # a small smooth pulse on one drive, sized in the testbench gen's REAL clocking:
+        # f_fabric 599.04 MHz with samps_per_clk 16 → envelopes need ≥48 samples to clear
+        # qick's 3-fabric-cycle minimum. T = 0.3 µs at 599.04 samples/µs → 180 samples.
+        times = collect(range(0.0, 0.3, length = 180))
+        pulse = LinearSplinePulse(0.05 .* sin.(range(0, π, length = 180))', times)
+        cmap = QickChannelMap([QickGenChannel(0, 5e3; i_drive = 1)]; n_drives = 1)
+        soc = StrumentoSoc(dev; drive_map = [(1, "qubit", "drive", 4000.0)],
+                           dac_rate = 599.04, adc_rate = 599.04, board = board)
+
+        blobs = execute!(soc, pulse, cmap, [180])   # final knot only
+        @test length(blobs) == 1
+        @test length(blobs[1]) == 1
+        @test isfinite(real(blobs[1][1])) && isfinite(imag(blobs[1][1]))
+        # MockQickSocV2 yields zero-valued IQ: the assertion that matters is that the
+        # pipeline produced a SHAPED single-read result — i.e. the Measure op made the
+        # compiler declare a readout channel, and acquire returned through it.
+        @test blobs[1][1] == 0.0 + 0.0im
+
+        # per-knot truncation: two knots on the same pulse produce two acquisitions
+        blobs2 = execute!(soc, pulse, cmap, [90, 180])
+        @test length(blobs2) == 2
+        # knot 1 (t=0) is refused loudly on the delegated path
+        @test_throws ErrorException execute!(soc, pulse, cmap, [1])
+    end
 end

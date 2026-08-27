@@ -1,0 +1,40 @@
+# loopback_demo — a minimal single-channel cqed instance matching the official qick
+# tProc-v2 *testbench* firmware config (devices/_fixtures/soccfg_v2_testbench.json):
+# ONE full-speed generator (ch 0) + ONE dynamic readout (ADC 0). Used by the offline
+# v2-assembly tests and CI: a real AveragerProgramV2 builds against this instance with
+# no board attached. Calibration values are synthetic.
+
+pack: cqed
+soccfg_snapshot: ../_fixtures/soccfg_v2_testbench.json
+
+wiring:
+  lines:
+    qubit:
+      name: qubit
+      generators:
+        - {role: drive, dac_ch: 0, nyquist: 1, gen_type: full}
+  readout:
+    dac_ch: 0
+    adc_chs: [0]
+
+topology:
+  - {type: Transmon, name: qubit}
+  - {type: ReadoutResonator, name: readout}
+
+calibration:
+  qubit:
+    f_ge: 4000.0
+    f_ef: 3820.0
+    T1: 100.0
+    pulses:
+      pi_ge:  {gain: 8192, sigma: 0.030, length: 0.0, type: gauss}
+      hpi_ge: {gain: 4096, sigma: 0.030, length: 0.0, type: gauss}
+      pi_ef:  {gain: 7600, sigma: 0.030, length: 0.0, type: gauss}
+  readout:
+    frequency: 750.0
+    gain: 1000
+    readout_length: 2.0
+    trig_offset: 400
+    relax_delay: 500
+    phase: 0.0
+    threshold: 0.0

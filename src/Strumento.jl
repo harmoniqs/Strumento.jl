@@ -24,15 +24,15 @@ using Reexport
 # Measurement, run_experiment, AbstractHardwareBackend, HardwareExperiment, …
 # are all in scope here.
 using Intonato
-# Intonato documents the AbstractHardwareBackend contract — upload_pulse! / trigger! /
-# readout / sample_rate — as duck-typed methods a backend must provide, but does NOT
-# declare them as exported generics. So this package OWNS these functions: they are
-# called only by its own StrumentoExperiment `run` closure (experiment.jl), never by
-# Intonato's chassis (which drives the HardwareExperiment through its `run` closure).
-function upload_pulse! end
-function trigger! end
-function readout end
-function sample_rate end
+# The AbstractHardwareBackend contract — upload_pulse! / trigger! / readout /
+# sample_rate — is declared AND exported by Intonato; Strumento extends those
+# generics for StrumentoBackend (backend.jl) and reexports them above. The
+# explicit `import` is load-bearing: `using` alone lets a method definition
+# SILENTLY shadow the imported generic with a fresh local function object (the
+# accident this seam used to work by), while `import` makes backend.jl's methods
+# attach to Intonato's own generics — the contract Intonato documents for
+# backends ("a backend `import`s and extends them").
+import Intonato: upload_pulse!, trigger!, readout, sample_rate
 using LinearAlgebra
 using PythonCall
 using TestItems

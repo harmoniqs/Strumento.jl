@@ -1,7 +1,8 @@
-# StrumentoBackend — the AbstractHardwareBackend over an AbstractSoc. Implements
-# Intonato's documented hardware interface (upload_pulse! / trigger! / readout /
-# sample_rate). The QILC chassis never calls these directly; the StrumentoExperiment
-# `run` closure (experiment.jl) does, once per experiment evaluation.
+# StrumentoBackend — the AbstractHardwareBackend over an AbstractSoc. Extends
+# Intonato's exported backend generics (upload_pulse! / trigger! / readout /
+# sample_rate — declared by Intonato itself in types/hardware_backends.jl; nothing
+# is re-declared locally). The QILC chassis never calls these directly; the
+# StrumentoExperiment `run` closure (experiment.jl) does, once per experiment evaluation.
 #
 # The soc owns *translation* — this is the option-(a) division of labour (see the
 # module docstring / README): a MockSoc translates the pulse in Julia (board-free
@@ -73,4 +74,19 @@ sample_rate(b::StrumentoBackend) = dac_rate(b.soc)
     @test b.last_raw === raw
     @test sum(real.(raw[1])) ≈ 1.0 atol=1e-6
     @test Strumento.sample_rate(b) == 20.0
+end
+
+@testitem "Backend generics are Intonato's exported functions (seam contract)" begin
+    using Strumento
+    using Intonato
+    # The AbstractHardwareBackend contract — upload_pulse! / trigger! / readout /
+    # sample_rate — is declared AND exported by Intonato (its PR #15). Strumento
+    # extends those generics (the methods earlier in this file) and reexports them;
+    # it must never re-declare its own, or the contract silently splits into two
+    # function objects and works only by accident. Assert identity of the function
+    # objects, not just callability.
+    for f in (:upload_pulse!, :trigger!, :readout, :sample_rate)
+        @test f in names(Intonato)                        # Intonato owns the export
+        @test getfield(Strumento, f) === getfield(Intonato, f)  # …and the SAME object
+    end
 end

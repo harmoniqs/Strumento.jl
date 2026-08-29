@@ -4,9 +4,9 @@ The Julia face of the [**strumento**](https://github.com/harmoniqs/strumento) QI
 tProc-v2 experiment framework, and [Intonato](https://github.com/harmoniqs/Intonato.jl)'s
 hardware backend for closed-loop quantum optimal control (QILC).
 
-> Renamed from `IntonatoQICK.jl`. The package's job narrowed to "hand a solved pulse to
-> `strumento`, get measurements back," so the name follows: it is the Julia binding to
-> `strumento`, not an Intonato-specific QICK translator.
+> Renamed from `IntonatoQICK.jl` on Jul 23, 2026 (the old repo is archived). The package's
+> job narrowed to "hand a solved pulse to `strumento`, get measurements back," so the name
+> follows: it is the Julia binding to `strumento`, not an Intonato-specific QICK translator.
 
 ## One source of truth (why a *face*, not a port)
 

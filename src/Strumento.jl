@@ -50,6 +50,7 @@ include("strumento_soc.jl")
 # vault documents: code loads records, it never owns parameters.
 include("twin_drift.jl")
 include("twin_records.jl")
+include("twin.jl")
 
 # ──── Exports ────────────────────────────────────────────────────────────────
 export AbstractSoc, MockSoc, StrumentoSoc

@@ -46,3 +46,30 @@ adc_rate(soc::AbstractSoc) =
     @test_throws ErrorException dac_rate(s)
     @test_throws ErrorException execute!(s, 0)
 end
+
+# ──── Pulse-sampling seam (extension-provided) ───────────────────────────────
+# Base is pulse-agnostic BY CONSTRUCTION: no Piccolo name may appear here, so
+# the delegation soc's sampling of a played pulse goes through this seam. These
+# are the duck-typed base signatures; the Piccolo extension adds the typed
+# methods (`duration` / `sample` on a Piccolo `AbstractPulse`) when it loads —
+# and exactly like the verb fallbacks above, an actionable error names what is
+# missing when the seam is called without it (a PythonCall-only environment:
+# the delegation soc exists, but no pulse-sampling method is loaded).
+
+pulse_duration(pulse) = error(
+    "Strumento.pulse_duration: no pulse-sampling method for $(typeof(pulse)) — " *
+    "this needs the Piccolo extension (add Piccolo to the environment and load it)")
+
+sample_controls(pulse, times) = error(
+    "Strumento.sample_controls: no pulse-sampling method for $(typeof(pulse)) — " *
+    "this needs the Piccolo extension (add Piccolo to the environment and load it)")
+
+@testitem "pulse-sampling seam errors actionably without the Piccolo extension" begin
+    using Strumento
+    # A type no extension will ever cover: the duck-typed stub must fire in
+    # EVERY load configuration (the typed methods dispatch only on
+    # Piccolo's AbstractPulse).
+    struct _DuckPulse end
+    @test_throws ErrorException Strumento.pulse_duration(_DuckPulse())
+    @test_throws ErrorException Strumento.sample_controls(_DuckPulse(), 0.0:1.0)
+end

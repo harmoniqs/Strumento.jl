@@ -11,7 +11,15 @@ real/mock/twin boards).
 > [Piccolo](https://github.com/harmoniqs/Piccolo.jl) and no longer depends on or reexports
 > Intonato — the closed-loop seam (`StrumentoBackend` / `StrumentoExperiment`) relocated to
 > [Intonato](https://github.com/harmoniqs/Intonato.jl) (≥ its next release, which depends on
-> this package).
+> this package). Since the weakdeps split (issue #16), Piccolo and PythonCall are package
+> **extensions** (weakdeps): the base package is the light contract surface (the soc
+> abstraction, the channel map, readout conversion, the `QickProgram` translation record,
+> the twin core) and carries neither the physics stack nor the Python bridge. Every function
+> verb on today's surface stays base-declared and dispatches to the extension's typed
+> methods when the trigger loads; the extension-defined *types* (`MockSoc`,
+> `StrumentoSoc`) are reached through `Base.get_extension` (extension exports do not surface
+> on the parent module). Consumers that never load the trigger deps get the light package by
+> construction.
 
 ## One source of truth (why a *face*, not a port)
 
@@ -26,16 +34,21 @@ the solved pulse to `strumento.from_solution` over
 
 - **`AbstractSoc`** and its verbs (`execute!`, `dac_rate`, `adc_rate`) — the board-controller
   abstraction every soc implements.
-- **`MockSoc`** — a pure-Julia "board" that translates the pulse in Julia and rolls it
-  through a known `QuantumSystem` (Piccolo-native propagation), emitting synthetic IQ. The
-  mock path runs and is tested with **no Python and no hardware**.
-- **`StrumentoSoc`** — the real board, reached by **delegating to Python `strumento`** over
+- **`MockSoc`** *(the Piccolo extension — reached via
+  `Base.get_extension(Strumento, :StrumentoPiccoloExt)`)* — a pure-Julia "board" that
+  translates the pulse in Julia and rolls it through a known `QuantumSystem`
+  (Piccolo-native propagation), emitting synthetic IQ. The mock path runs and is tested
+  with **no Python and no hardware**.
+- **`StrumentoSoc`** *(the PythonCall extension — reached via
+  `Base.get_extension(Strumento, :StrumentoPythonCallExt)`)* — the real board, reached by
+  **delegating to Python `strumento`** over
   PythonCall (lazy import; only on a board). `execute!` hands the pulse to
   `from_solution` then `StrumentoProgram` then `acquire` then `reduce`; the exact device
   wiring / drive-map / reduce conventions are finalized with the QICK collaboration on hardware.
 - **`QickChannelMap`** (device policy the mock uses: drive to gen-channel/carrier/IQ),
   **`pulse_to_envelopes`** (pulse → QICK-shaped envelopes, with the 16,384-sample
-  envelope-memory cap), and **`iq_to_measurements`** (IQ blob → `Measurement` via a
+  envelope-memory cap — base-declared verb; the `AbstractPulse` method rides the Piccolo
+  extension), and **`iq_to_measurements`** (IQ blob → `Measurement` via a
   caller-supplied discriminator) — the substrate-side translation and readout surface.
 - **Digital twins** (absorbed from [`Sosia.jl`](https://github.com/harmoniqs/Sosia.jl),
   vault spec-20260803-043304) — the twin core: drift processes
@@ -68,15 +81,24 @@ Intonato (Julia)   ->  QILC chassis + StrumentoBackend / StrumentoExperiment  (t
         board
 ```
 
-Intonato (the loop chassis) sits **above** this package and depends on it; the substrate is
-loadable without the control stack. The pure-Julia `MockSoc` short-circuits the bottom rungs
+Intonato (the loop chassis) sits **above** this package and depends on it; the substrate
+is loadable without the control stack, the physics stack, or the Python bridge — the
+extensions attach exactly when their trigger deps (`Piccolo`, `PythonCall`) load, every
+base verb dispatches through, and the extension types are one
+`Base.get_extension` away, while a sysimage or a twin-light consumer loads only the
+light base. The pure-Julia `MockSoc` short-circuits the bottom rungs
 with a `QuantumSystem` rollout (Piccolo `rollout`), so the soc contract is exercised
 board-free.
 
 ## Usage (mock)
 
 ```julia
-using Strumento
+using Strumento, Piccolo
+
+# The mock type is extension-defined (extension exports do not surface on the
+# parent module) — reach it through its canonical handle:
+using Strumento: Strumento
+MockSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).MockSoc
 
 # True device dynamics the "board" has (here with a model mismatch):
 sys_true = QuantumSystem(1.1 * σz, [σx], [1.0])
@@ -118,5 +140,8 @@ delegation path is validated with the QICK collaboration on hardware (it needs t
 `strumento` package + a board and is not exercised in CI). The twin core (drift, records,
 truth/belief contract) is absorbed from Sosia.jl (issue #15); family physics factories
 (the bosonic twin et al.), the soc face, and the wire server are later slices.
-Calibration routines and multi-board orchestration remain out of scope; the
-weakdeps/extensions split (PythonCall out of the hard deps) is a planned follow-up.
+Calibration routines and multi-board orchestration remain out of scope. The
+weakdeps/extensions split (issue #16) is done: Piccolo and PythonCall are package
+extensions — the base package (contract + twins) loads in an environment with neither,
+checked by `test/configurations/load_config_check.jl`; `Pkg.test()` still runs the full
+configuration (both triggers ride the test target).

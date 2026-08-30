@@ -1,14 +1,47 @@
-# StrumentoSoc — the real-board path, delegating to the Python `strumento` package
-# over PythonCall. This is the option-(a) seam (spec D18 / §16.4): Julia does NOT
+# StrumentoPythonCallExt — the PythonCall-triggered package extension (issue #16).
+#
+# The real-board delegation soc lives here: `StrumentoSoc` hands a solved pulse
+# to the Python `strumento` framework over PythonCall (the option-(a) seam).
+# The extension loads exactly when PythonCall is loaded; the base package
+# references no PythonCall name. Julia's extension semantics (1.12): extension
+# exports do NOT surface on the parent module — the soc contract verbs the
+# base declares duck-typed (`execute!`) gain their delegation methods here, so
+# bare-name calls work in every configuration; the extension-defined TYPE
+# (`StrumentoSoc`) is reached through
+# `Base.get_extension(Strumento, :StrumentoPythonCallExt)`.
+#
+# The soc contract is honored with a DUCK-TYPED `execute!` pulse argument: this
+# extension's only trigger is PythonCall, so no Piccolo name may appear here
+# either — the pulse sampling goes through the base pulse-sampling seam
+# (`Strumento.pulse_duration` / `Strumento.sample_controls`), whose typed
+# methods the Piccolo extension adds when Piccolo is also loaded. Without
+# Piccolo, calling the seam errors actionably (the base stubs).
+#
+# Testitems in this file guard on `Base.identify_package("PythonCall")` and skip
+# cleanly in configurations without the trigger.
+module StrumentoPythonCallExt
+
+import Strumento
+import Strumento: AbstractSoc, execute!, dac_rate, adc_rate, QickChannelMap
+using TestItems
+
+using PythonCall
+
+export StrumentoSoc
+
+# ──── StrumentoSoc ───────────────────────────────────────────────────────────
+# The real-board path, delegating to the Python `strumento` package over
+# PythonCall. This is the option-(a) seam (spec D18 / §16.4): Julia does NOT
 # assemble an AveragerProgramV2 itself; it hands the solved pulse to Python
-# `strumento`, which owns the pulse-IR → compile → acquire → reduce path. One source
-# of truth (Python), a Julia face here.
+# `strumento`, which owns the pulse-IR → compile → acquire → reduce path. One
+# source of truth (Python), a Julia face here.
 #
 # `strumento` is imported LAZILY inside the constructor (runtime, not load-time), so
-# loading Strumento.jl and the whole MockSoc path never touch Python. The delegation
-# body expresses the concrete calls, but the exact device wiring / drive_map / reduce
-# conventions are finalized against a board with the QICK collaboration — so this path
-# is NOT exercised in CI (constructing a StrumentoSoc requires the Python package).
+# loading this extension never initializes the interpreter and the whole MockSoc
+# path runs without Python. The delegation body expresses the concrete calls, but
+# the exact device wiring / drive_map / reduce conventions are finalized against
+# a board with the QICK collaboration — so this path is NOT exercised in CI
+# (constructing a StrumentoSoc requires the Python package).
 
 """
     StrumentoSoc(device; drive_map, dac_rate, adc_rate, board=nothing)
@@ -57,6 +90,9 @@ adc_rate(soc::StrumentoSoc) = soc.adc_rate
 
 # execute! — hand the pulse to Python `strumento` (from_solution → program → acquire →
 # reduce). This replaces the old inline-qick-assembly stub: strumento owns translation.
+# The pulse argument is DUCK-TYPED (this extension's only trigger is PythonCall, so
+# no Piccolo type may annotate it); sampling goes through the base pulse-sampling
+# seam, whose typed methods the Piccolo extension provides.
 #
 # Knot semantics (the AbstractSoc contract; see MockSoc): `indices` are MeasurementModel
 # knots into 1:N, and each knot's blob must be the IQ measured AT that knot's time. The
@@ -65,12 +101,12 @@ adc_rate(soc::StrumentoSoc) = soc.adc_rate
 # is appended (`from_solution` plays pulses only — the compiler declares readout channels
 # only when it sees one), the program compiles and acquires, and the averaged IQ becomes
 # that knot's blob. The old placeholder (repeat the final average per index) is gone.
-function execute!(soc::StrumentoSoc, pulse::AbstractPulse, ::QickChannelMap,
+function execute!(soc::StrumentoSoc, pulse, ::QickChannelMap,
                   indices::Vector{Int})
-    T = duration(pulse)
+    T = Strumento.pulse_duration(pulse)
     nsamp = floor(Int, T * soc.dac_rate) + 1
     times = collect(range(0.0, T, length = nsamp))
-    ctrls = sample(pulse, times)                       # (n_drives, nsamp)
+    ctrls = Strumento.sample_controls(pulse, times)    # (n_drives, nsamp)
 
     LineRef = soc.strumento.LineRef
     py_drive_map = pydict()
@@ -140,54 +176,74 @@ end
 
 @testitem "StrumentoSoc is an AbstractSoc (type only; no Python/board in CI)" begin
     using Strumento
-    @test StrumentoSoc <: Strumento.AbstractSoc
-    # Not constructed here: that needs the Python `strumento` package + a board, and
-    # would initialize PythonCall's interpreter. The delegation path is validated by
-    # the collaboration on hardware.
+    if Base.identify_package("PythonCall") === nothing
+        @info "skipping: no PythonCall in this environment (PythonCall-extension surface)"
+        @test true
+    else
+        using PythonCall
+        # The delegation type is extension-defined: extension exports do not
+        # surface on the parent module, so reach it through its canonical handle.
+        StrumentoSoc = Base.get_extension(Strumento, :StrumentoPythonCallExt).StrumentoSoc
+        @test StrumentoSoc <: Strumento.AbstractSoc
+        # Not constructed here: that needs the Python `strumento` package + a board, and
+        # would initialize PythonCall's interpreter. The delegation path is validated by
+        # the collaboration on hardware.
+    end
 end
 
 @testitem "StrumentoSoc delegation runs end-to-end on the Python mock (skips without Python strumento)" begin
     using Strumento
-    using PythonCall
-    # Embedded-Python hygiene: a bare interpreter (no shell locale) defaults to ASCII and
-    # chokes on the µ/– in device YAMLs — force UTF-8 mode before the interpreter starts.
-    ENV["PYTHONUTF8"] = "1"
-    st = try
-        pyimport("strumento")
-    catch e
-        @info "skipping: Python `strumento` not importable in this environment ($e)"
-        nothing
-    end
-    if st === nothing
-        @test true   # vacuous pass: the pure-Julia CI lane carries no Python strumento
+    if Base.identify_package("PythonCall") === nothing || Base.identify_package("Piccolo") === nothing
+        @info "skipping: the delegation end-to-end needs PythonCall AND Piccolo in this environment"
+        @test true
     else
-        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
-        board = pyimport("strumento.core.mock").MockQickSocV2.from_snapshot(
-            joinpath(fixtures, "_fixtures", "soccfg_v2_testbench.json"))
-        dev = st.Device.load(joinpath(fixtures, "loopback_demo", "device.yaml"))
+        using PythonCall
+        using Piccolo
+        # The delegation type is extension-defined: extension exports do not
+        # surface on the parent module, so reach it through its canonical handle.
+        StrumentoSoc = Base.get_extension(Strumento, :StrumentoPythonCallExt).StrumentoSoc
+        # Embedded-Python hygiene: a bare interpreter (no shell locale) defaults to ASCII and
+        # chokes on the µ/– in device YAMLs — force UTF-8 mode before the interpreter starts.
+        ENV["PYTHONUTF8"] = "1"
+        st = try
+            pyimport("strumento")
+        catch e
+            @info "skipping: Python `strumento` not importable in this environment ($e)"
+            nothing
+        end
+        if st === nothing
+            @test true   # vacuous pass: the pure-Julia CI lane carries no Python strumento
+        else
+            fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+            board = pyimport("strumento.core.mock").MockQickSocV2.from_snapshot(
+                joinpath(fixtures, "_fixtures", "soccfg_v2_testbench.json"))
+            dev = st.Device.load(joinpath(fixtures, "loopback_demo", "device.yaml"))
 
-        # a small smooth pulse on one drive, sized in the testbench gen's REAL clocking:
-        # f_fabric 599.04 MHz with samps_per_clk 16 → envelopes need ≥48 samples to clear
-        # qick's 3-fabric-cycle minimum. T = 0.3 µs at 599.04 samples/µs → 180 samples.
-        times = collect(range(0.0, 0.3, length = 180))
-        pulse = LinearSplinePulse(0.05 .* sin.(range(0, π, length = 180))', times)
-        cmap = QickChannelMap([QickGenChannel(0, 5e3; i_drive = 1)]; n_drives = 1)
-        soc = StrumentoSoc(dev; drive_map = [(1, "qubit", "drive", 4000.0)],
-                           dac_rate = 599.04, adc_rate = 599.04, board = board)
+            # a small smooth pulse on one drive, sized in the testbench gen's REAL clocking:
+            # f_fabric 599.04 MHz with samps_per_clk 16 → envelopes need ≥48 samples to clear
+            # qick's 3-fabric-cycle minimum. T = 0.3 µs at 599.04 samples/µs → 180 samples.
+            times = collect(range(0.0, 0.3, length = 180))
+            pulse = LinearSplinePulse(0.05 .* sin.(range(0, π, length = 180))', times)
+            cmap = QickChannelMap([QickGenChannel(0, 5e3; i_drive = 1)]; n_drives = 1)
+            soc = StrumentoSoc(dev; drive_map = [(1, "qubit", "drive", 4000.0)],
+                               dac_rate = 599.04, adc_rate = 599.04, board = board)
 
-        blobs = execute!(soc, pulse, cmap, [180])   # final knot only
-        @test length(blobs) == 1
-        @test length(blobs[1]) == 1
-        @test isfinite(real(blobs[1][1])) && isfinite(imag(blobs[1][1]))
-        # MockQickSocV2 yields zero-valued IQ: the assertion that matters is that the
-        # pipeline produced a SHAPED single-read result — i.e. the Measure op made the
-        # compiler declare a readout channel, and acquire returned through it.
-        @test blobs[1][1] == 0.0 + 0.0im
+            blobs = execute!(soc, pulse, cmap, [180])   # final knot only
+            @test length(blobs) == 1
+            @test length(blobs[1]) == 1
+            @test isfinite(real(blobs[1][1])) && isfinite(imag(blobs[1][1]))
+            # MockQickSocV2 yields zero-valued IQ: the assertion that matters is that the
+            # pipeline produced a SHAPED single-read result — i.e. the Measure op made the
+            # compiler declare a readout channel, and acquire returned through it.
+            @test blobs[1][1] == 0.0 + 0.0im
 
-        # per-knot truncation: two knots on the same pulse produce two acquisitions
-        blobs2 = execute!(soc, pulse, cmap, [90, 180])
-        @test length(blobs2) == 2
-        # knot 1 (t=0) is refused loudly on the delegated path
-        @test_throws ErrorException execute!(soc, pulse, cmap, [1])
+            # per-knot truncation: two knots on the same pulse produce two acquisitions
+            blobs2 = execute!(soc, pulse, cmap, [90, 180])
+            @test length(blobs2) == 2
+            # knot 1 (t=0) is refused loudly on the delegated path
+            @test_throws ErrorException execute!(soc, pulse, cmap, [1])
+        end
     end
 end
+
+end # module StrumentoPythonCallExt

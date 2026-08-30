@@ -48,6 +48,7 @@ include("strumento_soc.jl")
 # Drift processes, the vault twin-record loader, and the truth/belief/record
 # contract (vault spec-20260803-043304-digital-twins-sosia). Twin records are
 # vault documents: code loads records, it never owns parameters.
+include("twin_drift.jl")
 include("twin_records.jl")
 
 # ──── Exports ────────────────────────────────────────────────────────────────

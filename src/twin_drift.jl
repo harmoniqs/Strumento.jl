@@ -234,3 +234,170 @@ end
     # input dict untouched (pure function)
     @test truth[:omega] == 4.0
 end
+
+# ─── Spec-floor extensions (issue #15) ───────────────────────────────────────
+# The exact-Gaussian OU transition vs Euler-stepped wrongness, replay across
+# fresh processes, and golden pins captured from the absorbed implementation
+# (Distributions 0.25.131, StableRNGs 1.0.4, Julia 1.12.5).
+
+@testitem "OrnsteinUhlenbeck — one step is the exact Gaussian transition" begin
+    using Strumento
+    using StableRNGs
+    using Statistics
+    # One step from a fixed x₀: the transition is Gaussian with
+    # mean μ + (x₀-μ)e^{-θdt} and std σ√(1-e^{-2θdt}).
+    ou = OrnsteinUhlenbeck(theta = 0.5, sigma = 0.02, mu = 100.0)
+    steps = [step!(ou, 110.0, 2.0, StableRNG(seed)) for seed in 1:20000]
+    @test mean(steps) ≈ 100.0 + 10.0 * exp(-1.0) rtol = 1e-3
+    @test std(steps) ≈ 0.02 * sqrt(1 - exp(-2.0)) rtol = 0.01
+end
+
+@testitem "OrnsteinUhlenbeck — exact transition vs Euler at coarse dt (stationary std)" begin
+    using Strumento
+    using StableRNGs
+    using Statistics
+    # θdt = 1.5: the exact transition keeps the stationary std at σ for ANY dt.
+    # An Euler step on the SDE matched to the same stationary law (σ_E = σ√(2θ))
+    # doubles it: Var_Euler = σ_E²dt/(1-(1-θdt)²) = 4σ² at θdt = 1.5.
+    theta, sigma, dt, n = 1.0, 0.1, 1.5, 6000
+    ou = OrnsteinUhlenbeck(theta = theta, sigma = sigma, mu = 0.0)
+    exact = let x = 0.0, acc = Float64[], rng = StableRNG(1234)
+        for _ in 1:n
+            x = step!(ou, x, dt, rng); push!(acc, x)
+        end
+        acc
+    end
+    euler = let x = 0.0, acc = Float64[], rng = StableRNG(1234), sE = sigma * sqrt(2theta)
+        for _ in 1:n
+            x = x - theta * x * dt + sE * sqrt(dt) * randn(rng); push!(acc, x)
+        end
+        acc
+    end
+    @test std(exact[1001:end]) ≈ sigma rtol = 0.1          # exact stays at σ
+    @test std(euler[1001:end]) ≈ 2 * sigma rtol = 0.1      # Euler: 2σ — discretization bias
+    @test std(euler[1001:end]) > 1.6 * std(exact[1001:end])
+end
+
+@testitem "OrnsteinUhlenbeck — lag-1 autocorrelation exp(-θdt): exact vs Euler" begin
+    using Strumento
+    using StableRNGs
+    using Statistics
+    # The exact transition has lag-k correlation e^{-θkdt} at ANY dt; the Euler
+    # AR(1) has (1-θdt)^k. At θdt = 0.5 those are 0.607 vs 0.5 — distinguishable.
+    theta, sigma, dt, n = 1.0, 0.1, 0.5, 20000
+    ou = OrnsteinUhlenbeck(theta = theta, sigma = sigma, mu = 0.0)
+    autocorr(v, lag) = (vv = v .- mean(v); sum(vv[1:end-lag] .* vv[1+lag:end]) / sum(vv .^ 2))
+    exact = let x = 0.0, acc = Float64[], rng = StableRNG(42)
+        for _ in 1:n
+            x = step!(ou, x, dt, rng); push!(acc, x)
+        end
+        acc
+    end
+    euler = let x = 0.0, acc = Float64[], rng = StableRNG(42), sE = sigma * sqrt(2theta)
+        for _ in 1:n
+            x = x - theta * x * dt + sE * sqrt(dt) * randn(rng); push!(acc, x)
+        end
+        acc
+    end
+    @test autocorr(exact[1001:end], 1) ≈ exp(-theta * dt) atol = 0.015
+    @test autocorr(euler[1001:end], 1) ≈ 1 - theta * dt atol = 0.015
+    @test abs(autocorr(exact[1001:end], 1) - autocorr(euler[1001:end], 1)) > 0.05
+end
+
+@testitem "OrnsteinUhlenbeck — replay across fresh processes (bit-exact)" begin
+    using Strumento
+    using StableRNGs
+    trajectory(seed) = let ou = OrnsteinUhlenbeck(theta = 1.0, sigma = 0.03, mu = 0.0),
+                            rng = StableRNG(seed), x = 1.0, acc = Float64[]
+        for _ in 1:50
+            x = step!(ou, x, 0.05, rng); push!(acc, x)
+        end
+        acc
+    end
+    # FRESH process objects each call — replay must not depend on shared state
+    @test trajectory(7) == trajectory(7)
+    @test trajectory(7) != trajectory(8)
+end
+
+@testitem "OrnsteinUhlenbeck — golden pin: seeded trajectory bit-exact" begin
+    using Strumento
+    using StableRNGs
+    # GOLDEN PIN — captured from the absorbed Sosia implementation (issue #15)
+    # before any adaptation: θ=1, σ=0.03, μ=0, x₀=1, dt=0.05, StableRNG(7).
+    # `==`, no tolerance: a deviation is a behavior change, never noise.
+    ou = OrnsteinUhlenbeck(theta = 1.0, sigma = 0.03, mu = 0.0)
+    rng = StableRNG(7)
+    got = let x = 1.0, acc = Float64[]
+        for _ in 1:5
+            x = step!(ou, x, 0.05, rng); push!(acc, x)
+        end
+        acc
+    end
+    @test got == [0.932471738707425, 0.8941451344605106, 0.8459799475465459,
+                  0.7947853076362916, 0.7621492912296226]
+end
+
+@testitem "RandomTelegraph — replay across fresh processes (bit-exact)" begin
+    using Strumento
+    using StableRNGs
+    rt_traj(seed) = let rt = RandomTelegraph(gamma_up = 2.0, gamma_down = 2.0, amplitude = 3.0),
+                         rng = StableRNG(seed), x = 0.0, acc = Float64[]
+        for _ in 1:200
+            x = step!(rt, x, 0.05, rng); push!(acc, x)
+        end
+        acc
+    end
+    @test rt_traj(99) == rt_traj(99)      # fresh process + fresh rng, same seed
+    @test rt_traj(99) != rt_traj(100)     # different seed → different chain
+end
+
+@testitem "RandomTelegraph — only the CHANGE in offset moves the parameter" begin
+    using Strumento
+    using StableRNGs
+    # gamma = 0: the chain never flips; the first step applies the +amplitude
+    # offset (state starts +1, applied 0), then the value is stationary.
+    rt0 = RandomTelegraph(gamma_up = 0.0, gamma_down = 0.0, amplitude = 3.0)
+    let x = 0.0, rng = StableRNG(5)
+        x = step!(rt0, x, 0.05, rng); @test x == 3.0
+        x = step!(rt0, x, 0.05, rng); @test x == 3.0
+        x = step!(rt0, x, 0.05, rng); @test x == 3.0
+    end
+    # gamma → ∞: the chain flips every step; each step moves x by the offset
+    # CHANGE (−3, then +6, then −6, …) — x only ever sits at ±amplitude.
+    rtH = RandomTelegraph(gamma_up = 1e9, gamma_down = 1e9, amplitude = 3.0)
+    let x = 0.0, rng = StableRNG(5)
+        x = step!(rtH, x, 0.05, rng); @test x == -3.0
+        x = step!(rtH, x, 0.05, rng); @test x == 3.0
+        x = step!(rtH, x, 0.05, rng); @test x == -3.0
+        x = step!(rtH, x, 0.05, rng); @test x == 3.0
+    end
+end
+
+@testitem "JumpSchedule — unlisted times pass through; a scheduled time applies" begin
+    using Strumento
+    using StableRNGs
+    js = JumpSchedule(times = [1.0, 3.0], deltas = [1.5, -0.5])
+    rng = StableRNG(1)
+    @test step!(js, 10.0, 0.5, rng; t = 2.0) == 10.0    # between scheduled times
+    @test step!(js, 10.0, 0.5, rng; t = 0.0) == 10.0    # before any
+    @test step!(js, 10.0, 0.5, rng; t = 1.0) == 11.5    # at a scheduled time
+    @test step!(js, 10.0, 0.5, rng; t = 3.0) == 9.5     # the other scheduled time
+end
+
+@testitem "DriftPlan — chains compose additively; unplanned and missing params pass through" begin
+    using Strumento
+    using StableRNGs
+    plan = DriftPlan(:omega => [Ramp(rate = 0.1), Ramp(rate = 0.2)])
+    truth = Dict{Symbol, Float64}(:omega => 4.0, :delta => 0.2)
+    out = apply(plan, truth, 1.0, StableRNG(1); t = 0.0)
+    @test out[:omega] == 4.3                 # both processes applied, additively
+    @test out[:delta] == 0.2                 # unplanned parameter untouched
+    @test truth[:omega] == 4.0               # pure function: input untouched
+    # a plan naming a parameter the truth lacks is skipped, not an error
+    plan2 = DriftPlan(:missing => [Ramp(rate = 1.0)])
+    out2 = apply(plan2, Dict{Symbol, Float64}(:omega => 4.0), 1.0, StableRNG(1))
+    @test out2 == Dict{Symbol, Float64}(:omega => 4.0)
+    # the empty plan is the identity
+    @test apply(DriftPlan(), Dict{Symbol, Float64}(:a => 1.0), 1.0, StableRNG(1)) ==
+          Dict{Symbol, Float64}(:a => 1.0)
+end

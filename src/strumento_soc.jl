@@ -15,7 +15,7 @@
 
 Real board reached by delegating to the Python `strumento` framework via PythonCall.
 `device` is a strumento device-instance YAML path (or a Python `Device` handle);
-`drive_map` maps each Intonato drive index to a `(drive_index, line, role, carrier_mhz)`
+`drive_map` maps each Piccolo drive index to a `(drive_index, line, role, carrier_mhz)`
 tuple naming the strumento wiring line/role and its carrier. On `execute!`, the played
 pulse is handed to `strumento.from_solution` and run through a `StrumentoProgram` on the
 board — Julia never assembles the program.

@@ -1,4 +1,4 @@
-# Pulse → QICK waveform translation (pure functions). Samples an Intonato pulse
+# Pulse → QICK waveform translation (pure functions). Samples a Piccolo pulse
 # onto each generator channel's DAC grid (via Piccolo `sample`) and packs the
 # routed controls into complex (idata, qdata) envelopes plus the metadata a
 # board needs to play and read them back.

@@ -2,7 +2,62 @@
 # Drift moves truth only; calibration moves belief only (spec-20260803-043304).
 #
 # Absorbed from harmoniqs/Sosia.jl (spec-20260803-043304-digital-twins-sosia),
-# issue #15 — ported tests first (RED), implementation follows.
+# issue #15 — ported faithfully; naming carried as-is.
+
+using StableRNGs: StableRNG
+
+export DigitalTwin, instantiate, believed, advance!, calibrate!
+
+"""
+    DigitalTwin
+
+A device-shaped object the Loop runs against exactly as hardware:
+
+- `record` — the vault twin record (parameters, noise, drift priors, provenance)
+- `truth` — hidden parameters, evolving under a `DriftPlan`
+- `belief` — what the calibration store currently knows (moves only via `calibrate!`)
+- `rng` — the seeded replayable source of all stochasticity
+- `t` — twin time (days by convention)
+"""
+mutable struct DigitalTwin
+    record::TwinRecord
+    truth::Dict{Symbol, Float64}
+    belief::Dict{String, Any}
+    plan::DriftPlan
+    rng::StableRNG
+    t::Float64
+end
+
+"""
+    instantiate(record_path; drift, seed) -> DigitalTwin
+
+Build a twin from a vault record. Truth initializes at the record parameters
+(belief and truth agree — until drift).
+"""
+function instantiate(record_path::AbstractString; drift::DriftPlan, seed::Integer)
+    record = load_record(record_path)
+    truth = Dict{Symbol, Float64}(
+        Symbol(k) => float(v) for (k, v) in record.parameters if v isa Real
+    )
+    belief = deepcopy(record.parameters)
+    return DigitalTwin(record, truth, belief, drift, StableRNG(seed), 0.0)
+end
+
+"""The calibration store's current beliefs (record parameters + calibrations)."""
+believed(twin::DigitalTwin) = twin.belief
+
+"""Evolve the twin's truth by `dt` under its drift plan. Belief untouched."""
+function advance!(twin::DigitalTwin, dt::Real)
+    twin.truth = apply(twin.plan, twin.truth, dt, twin.rng; t = twin.t)
+    twin.t += dt
+    return twin
+end
+
+"""A calibration write-back: update belief (never truth)."""
+function calibrate!(twin::DigitalTwin, updates::Dict)
+    merge!(twin.belief, updates)
+    return twin
+end
 
 @testitem "instantiate — truth from record, belief = record, seeded" begin
     using Strumento

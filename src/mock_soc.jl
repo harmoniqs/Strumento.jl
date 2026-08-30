@@ -100,3 +100,29 @@ end
     @test sum(pops) ≈ 1.0 atol=1e-6        # valid probability vector
     @test all(pops .≥ -1e-9)
 end
+
+@testitem "MockSoc IQ forward model is pinned to golden values (exact equality)" begin
+    using Strumento
+    # GOLDEN PIN — captured from the Intonato-`SimulatedExperiment` rollout (the
+    # pre-re-grounding forward model, Strumento v0.1.x, Piccolo 2.0.2, Julia 1.12)
+    # for this FIXED fixture: 2-drive system, deterministic analytic I/Q pulse,
+    # one complex-envelope gen channel, two measurement knots (DAC-grid samples
+    # 11 and 101), dac_rate = 20 Hz. The rollout swap (issue #14: Piccolo-native
+    # propagation replacing the SimulatedExperiment) must reproduce these blobs
+    # BIT-FOR-BIT — `==`, no tolerance. A last-ulp deviation here is a behavior
+    # change, not noise: report it, never silently widen.
+    σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+    sys = QuantumSystem(1.0 * σz, [σx, σx], [1.0, 1.0])
+    N = 11; T = 5.0
+    times = collect(range(0.0, T, length=N))
+    vals = 0.1 .* permutedims(hcat(sin.(range(0.0, 2.4π, length=N)),
+                                   cos.(range(0.3π, 1.7π, length=N))))
+    pulse = LinearSplinePulse(vals, times)
+    map = QickChannelMap([QickGenChannel(0, 5e9; i_drive=1, q_drive=2)]; n_drives=2)
+
+    soc = MockSoc(sys, ComplexF64[1, 0], ComplexF64[0, 1]; dac_rate=20.0)
+    raw = execute!(soc, pulse, map, [11, 101])
+
+    @test raw == [ComplexF64[0.9987748357943047 + 0.0im, 0.0012251642056963555 + 0.0im],
+                  ComplexF64[0.9552991750369558 + 0.0im, 0.044700824963045074 + 0.0im]]
+end

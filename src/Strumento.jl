@@ -19,6 +19,13 @@ rollouts, `AbstractPulse` translation, reexported here). The closed-loop seam �
 `StrumentoBackend` / `StrumentoExperiment` — relocated to Intonato (≥ its next
 release, which depends on this package); the instrument layer no longer knows the
 calibration loop.
+
+**Digital twins (absorbed from harmoniqs/Sosia.jl, spec-20260803-043304):** the
+twin core — drift processes (OU with the exact Gaussian transition, ramp, random
+telegraph, scheduled jumps; `DriftPlan` composition), the vault twin-record loader
+(`TwinRecord` / `load_record` / `RecordError`), and the `DigitalTwin` truth/belief/
+record contract (`instantiate`, `believed`, `advance!`, `calibrate!`). Twin records
+are vault documents: code loads records, it never owns parameters.
 """
 module Strumento
 
@@ -43,6 +50,14 @@ include("readout.jl")
 # ──── Backends ───────────────────────────────────────────────────────────────
 include("mock_soc.jl")
 include("strumento_soc.jl")
+
+# ──── Digital twins (absorbed from harmoniqs/Sosia.jl) ──────────────────────
+# Drift processes, the vault twin-record loader, and the truth/belief/record
+# contract (vault spec-20260803-043304-digital-twins-sosia). Twin records are
+# vault documents: code loads records, it never owns parameters.
+include("twin_drift.jl")
+include("twin_records.jl")
+include("twin.jl")
 
 # ──── Exports ────────────────────────────────────────────────────────────────
 export AbstractSoc, MockSoc, StrumentoSoc

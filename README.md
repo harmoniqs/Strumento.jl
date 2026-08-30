@@ -37,6 +37,26 @@ the solved pulse to `strumento.from_solution` over
   **`pulse_to_envelopes`** (pulse → QICK-shaped envelopes, with the 16,384-sample
   envelope-memory cap), and **`iq_to_measurements`** (IQ blob → `Measurement` via a
   caller-supplied discriminator) — the substrate-side translation and readout surface.
+- **Digital twins** (absorbed from [`Sosia.jl`](https://github.com/harmoniqs/Sosia.jl),
+  vault spec-20260803-043304) — the twin core: drift processes
+  (`OrnsteinUhlenbeck` with the exact Gaussian transition, `Ramp`, `RandomTelegraph`,
+  `JumpSchedule`, composed per parameter via `DriftPlan`), the vault twin-record
+  loader (`load_record` → `TwinRecord`; records are vault documents — code loads
+  records, it never owns parameters), and the `DigitalTwin` truth/belief/record
+  contract (`instantiate`, `believed`, `advance!`, `calibrate!` — drift moves truth
+  only, calibration moves belief only). Seeded replay is bit-exact: a calibration
+  failure reproduces exactly.
+
+```julia
+using Strumento
+
+twin = instantiate("model-of-lab/stanford-bosonic.md";
+                   drift = DriftPlan(:chi_kHz => [OrnsteinUhlenbeck(theta = 0.07, sigma = 3.0, mu = -300.0)]),
+                   seed = 0xC0FFEE)
+advance!(twin, 1.0)     # drift the truth one day (belief untouched)
+believed(twin)          # what calibration currently knows
+calibrate!(twin, Dict("chi_kHz" => twin.truth[:chi_kHz]))   # write-back (truth untouched)
+```
 
 ## The division of labour
 
@@ -95,6 +115,8 @@ enhancement).
 
 Interface-complete with a tested pure-Julia mock suite. The real-board `StrumentoSoc`
 delegation path is validated with the QICK collaboration on hardware (it needs the Python
-`strumento` package + a board and is not exercised in CI). Calibration routines, multi-board
-orchestration, and the twin core are out of scope for v0.2; the weakdeps/extensions split
-(PythonCall out of the hard deps) is a planned follow-up.
+`strumento` package + a board and is not exercised in CI). The twin core (drift, records,
+truth/belief contract) is absorbed from Sosia.jl (issue #15); family physics factories
+(the bosonic twin et al.), the soc face, and the wire server are later slices.
+Calibration routines and multi-board orchestration remain out of scope; the
+weakdeps/extensions split (PythonCall out of the hard deps) is a planned follow-up.

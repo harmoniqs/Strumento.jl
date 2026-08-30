@@ -1,4 +1,4 @@
-# QickChannelMap — device policy: how Intonato drive controls route onto QICK
+# QickChannelMap — device policy: how Piccolo drive controls route onto QICK
 # generator channels. A phase-modulated drive (Ω, φ(t)) is a single complex
 # envelope on ONE gen channel: the two quadrature controls (I = Ω cos φ,
 # Q = Ω sin φ) load to the SAME channel's idata/qdata, up-converted by that
@@ -7,7 +7,7 @@
 """
     QickGenChannel(gen_ch, carrier_freq; i_drive, q_drive=nothing)
 
-One generator channel: `gen_ch` plays a complex envelope built from Intonato
+One generator channel: `gen_ch` plays a complex envelope built from Piccolo
 control index `i_drive` (I quadrature) and optional `q_drive` (Q quadrature),
 up-converted at `carrier_freq` (Hz). `q_drive = nothing` ⇒ a real envelope.
 """
@@ -24,7 +24,7 @@ QickGenChannel(gen_ch::Int, carrier_freq::Real; i_drive::Int, q_drive=nothing) =
 """
     QickChannelMap(channels; readout_chs, n_drives)
 
-Validated map from Intonato drive controls → QICK generator channels.
+Validated map from Piccolo drive controls → QICK generator channels.
 `n_drives` is the control count of the pulses to be played; every drive index
 referenced must be in `1:n_drives`, no drive may be mapped twice, and gen
 channels must be distinct.

@@ -1,20 +1,38 @@
 # MockSoc — a pure-Julia "board" that simulates QICK execution by rolling the
-# played pulse through a known `QuantumSystem` (Intonato's own `rollout`, via a
-# `SimulatedExperiment`) and emitting synthetic IQ. The forward model is explicit:
+# played pulse through a known `QuantumSystem` (Piccolo-native propagation:
+# `rollout` on a `KetTrajectory`) and emitting synthetic IQ. The forward model
+# is explicit:
 #   state → IQ blob = measurement_fn(state) packed as a real-valued complex vector,
 # which the trivial discriminator `real` inverts EXACTLY. So a QILC loop run
-# through `StrumentoBackend{MockSoc}` reproduces the same measurements a direct
-# `SimulatedExperiment` would — the loop is validated without a board.
+# through the (relocated, Intonato-side) `StrumentoBackend{MockSoc}` reproduces
+# the same measurements a direct simulated rollout would — the loop is validated
+# without a board.
 #
 # The user passes the "true" (optionally mismatched) system as the mock's system;
 # the nominal QCP is solved against the nominal system separately.
 
 """
+    populations(x::AbstractVector)
+
+Level populations |ψ_j|² from iso-vec ket (Re(ψ), Im(ψ)) — MockSoc's default
+forward model. Substrate-local since v0.2 (issue #14): the identical function
+Intonato exports on the loop side, kept unexported here so `using Strumento,
+Intonato` consumers keep a single `populations` binding (Intonato's).
+"""
+function populations(x::AbstractVector)
+    n = length(x) ÷ 2
+    x_re = @view x[1:n]
+    x_im = @view x[(n+1):2n]
+    return x_re .^ 2 .+ x_im .^ 2
+end
+
+"""
     MockSoc(system, ψ_init, ψ_goal; measurement_fn=populations, dac_rate=1.0, adc_rate=1.0)
 
 A simulated QICK SoC backed by `system`. `play_program!`/`acquire` reconstruct the
-played pulse from the loaded envelopes and roll it out via a `SimulatedExperiment`,
-returning IQ blobs `measurement_fn(state)` (packed as complex; invert with `real`).
+played pulse from the loaded envelopes and roll it out via Piccolo's `rollout`
+(`KetTrajectory` propagation through `system`), returning IQ blobs
+`measurement_fn(state)` (packed as complex; invert with `real`).
 """
 mutable struct MockSoc <: AbstractSoc
     system::QuantumSystem
@@ -68,12 +86,17 @@ function acquire(soc::MockSoc, _ro_chs)
         q_drive === nothing || (ctrls[q_drive, :] .= qdata)
     end
     recon = LinearSplinePulse(ctrls, prog.times)
-    # Single simulation path: roll out via a SimulatedExperiment over the system.
-    model = MeasurementModel(:ψ̃, [soc.measurement_fn for _ in prog.indices], prog.indices)
-    exp = SimulatedExperiment(KetTrajectory(soc.system, recon, soc.ψ_init, soc.ψ_goal), model)
-    ms = run_experiment(exp, recon)
+    # Piccolo-native propagation (v0.2, issue #14 — the same `rollout` the
+    # Intonato `SimulatedExperiment` path called under the hood, so the forward
+    # model is bit-for-bit unchanged; pinned by the golden testitem below):
+    # propagate ψ through the system under the reconstructed controls, then
+    # evaluate the forward model at each measurement knot (indices index into
+    # the reconstructed pulse's DAC-grid knot times).
+    qtraj = rollout(KetTrajectory(soc.system, recon, soc.ψ_init, soc.ψ_goal), recon)
+    knot_times = get_knot_times(recon)
     # Forward model state→IQ: pack each measurement's data as a complex blob.
-    return [ComplexF64.(m.data) for m in ms]
+    return [ComplexF64.(soc.measurement_fn(ket_to_iso(qtraj(knot_times[k]))))
+            for k in prog.indices]
 end
 
 @testitem "MockSoc round-trips a pulse to valid populations IQ" begin

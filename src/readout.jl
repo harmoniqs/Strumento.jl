@@ -1,10 +1,29 @@
 # Readout conversion (pure function): raw per-measurement IQ → Vector{Measurement}.
 #
-# `raw` is indexed in alignment with `indices` (the MeasurementModel knot indices
-# into 1:N): `raw[k]` is the IQ blob for measurement at knot `indices[k]`. The
-# caller-supplied `discriminator` maps one IQ blob → a data vector (e.g. level
-# populations or Pauli expectations). This is the only device/calibration-specific
-# step on the readout side, so it is supplied by the user, not owned here.
+# `raw` is indexed in alignment with `indices` (the measurement knot indices
+# into the played pulse's knot grid): `raw[k]` is the IQ blob for measurement at
+# knot `indices[k]`. The caller-supplied `discriminator` maps one IQ blob → a
+# data vector (e.g. level populations or Pauli expectations). This is the only
+# device/calibration-specific step on the readout side, so it is supplied by the
+# user, not owned here.
+
+"""
+    Measurement
+
+Singular data container: one measurement function evaluated at one knot point.
+Substrate-owned since v0.2 (issue #14) — the record type `iq_to_measurements`
+returns; the closed-loop seam (Intonato ≥ its next release) consumes these.
+
+# Fields
+- `data::Vector{Float64}`: measurement output g_j(x_{π_j}), variable length
+- `index::Int`: knot point index π_j
+"""
+struct Measurement
+    data::Vector{Float64}
+    index::Int
+end
+
+Base.length(m::Measurement) = length(m.data)
 
 """
     iq_to_measurements(raw, discriminator, indices) → Vector{Measurement}

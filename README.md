@@ -1,12 +1,17 @@
 # Strumento.jl
 
 The Julia face of the [**strumento**](https://github.com/harmoniqs/strumento) QICK
-tProc-v2 experiment framework, and [Intonato](https://github.com/harmoniqs/Intonato.jl)'s
-hardware backend for closed-loop quantum optimal control (QILC).
+tProc-v2 experiment framework — the standalone substrate layer (the soc registry:
+real/mock/twin boards).
 
 > Renamed from `IntonatoQICK.jl` on Jul 23, 2026 (the old repo is archived). The package's
 > job narrowed to "hand a solved pulse to `strumento`, get measurements back," so the name
 > follows: it is the Julia binding to `strumento`, not an Intonato-specific QICK translator.
+> Since v0.2 (issue #14) the dependency edge is inverted: this package stands alone on
+> [Piccolo](https://github.com/harmoniqs/Piccolo.jl) and no longer depends on or reexports
+> Intonato — the closed-loop seam (`StrumentoBackend` / `StrumentoExperiment`) relocated to
+> [Intonato](https://github.com/harmoniqs/Intonato.jl) (≥ its next release, which depends on
+> this package).
 
 ## One source of truth (why a *face*, not a port)
 
@@ -19,33 +24,34 @@ the solved pulse to `strumento.from_solution` over
 
 ## What it provides
 
-- **`StrumentoBackend <: AbstractHardwareBackend`** — the seam Intonato's `PulseTuningProblem`
-  chassis consumes (`upload_pulse!` / `trigger!` / `readout` / `sample_rate`) over an
-  abstract `AbstractSoc`.
-- **`MockSoc`** — a pure-Julia "board" that translates the pulse in Julia and rolls it through
-  a known `QuantumSystem`, emitting synthetic IQ. The whole QILC to board loop runs and is
-  tested with **no Python and no hardware**.
+- **`AbstractSoc`** and its verbs (`execute!`, `dac_rate`, `adc_rate`) — the board-controller
+  abstraction every soc implements.
+- **`MockSoc`** — a pure-Julia "board" that translates the pulse in Julia and rolls it
+  through a known `QuantumSystem` (Piccolo-native propagation), emitting synthetic IQ. The
+  mock path runs and is tested with **no Python and no hardware**.
 - **`StrumentoSoc`** — the real board, reached by **delegating to Python `strumento`** over
   PythonCall (lazy import; only on a board). `execute!` hands the pulse to
   `from_solution` then `StrumentoProgram` then `acquire` then `reduce`; the exact device
   wiring / drive-map / reduce conventions are finalized with the QICK collaboration on hardware.
-- **`QickChannelMap`** (device policy the mock uses: drive to gen-channel/carrier/IQ) and a
-  caller-supplied discriminator (IQ to state).
-- **`StrumentoExperiment(backend; measurement_model)`** to an Intonato `HardwareExperiment` you
-  drop straight into `PulseTuningProblem`.
+- **`QickChannelMap`** (device policy the mock uses: drive to gen-channel/carrier/IQ),
+  **`pulse_to_envelopes`** (pulse → QICK-shaped envelopes, with the 16,384-sample
+  envelope-memory cap), and **`iq_to_measurements`** (IQ blob → `Measurement` via a
+  caller-supplied discriminator) — the substrate-side translation and readout surface.
 
 ## The division of labour
 
 ```
-Intonato (Julia)   ->  AbstractPulse / solution      (QILC chassis)
-  Strumento.jl     ->  StrumentoBackend / StrumentoExperiment  <- this package (the face)
+Intonato (Julia)   ->  QILC chassis + StrumentoBackend / StrumentoExperiment  (the loop)
+  Strumento.jl     ->  AbstractSoc registry: MockSoc / StrumentoSoc           <- this package (the substrate)
     StrumentoSoc   ->  PythonCall -> Python strumento  (from_solution -> compile -> acquire -> reduce)
       strumento    ->  device model . pulse IR . compiler . program     (the authority)
         board
 ```
 
-The pure-Julia `MockSoc` short-circuits the bottom rungs with a `QuantumSystem` rollout, so the
-chassis-to-backend contract is exercised board-free.
+Intonato (the loop chassis) sits **above** this package and depends on it; the substrate is
+loadable without the control stack. The pure-Julia `MockSoc` short-circuits the bottom rungs
+with a `QuantumSystem` rollout (Piccolo `rollout`), so the soc contract is exercised
+board-free.
 
 ## Usage (mock)
 
@@ -56,14 +62,19 @@ using Strumento
 sys_true = QuantumSystem(1.1 * σz, [σx], [1.0])
 soc = MockSoc(sys_true, ψ_init, ψ_goal; dac_rate = 80.0)
 
-map   = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1)]; n_drives = 1)
-model = MeasurementModel(:ψ̃, [populations], [N])
-qexp  = StrumentoExperiment(StrumentoBackend(soc, map, [N]); measurement_model = model)
+map = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1)]; n_drives = 1)
 
-# Plug into Intonato's QILC chassis (a concrete tuning strategy is supplied separately):
-ptp = PulseTuningProblem(qcp, qexp, model; R_tr = (u = 0.1,), Q_meas = 10.0)
-solve!(ptp; max_iter = 10)
+# Translate + play + read: raw per-knot IQ blobs (default forward model:
+# populations, packed complex — invert with `real`).
+raw = execute!(soc, pulse, map, [N])
+
+# Or convert to measurements with a discriminator:
+ms = iq_to_measurements(raw, b -> real.(b), [N])
 ```
+
+Closing the loop (upload/trigger/readout through `StrumentoBackend`, wrapping the soc as a
+`HardwareExperiment` for `PulseTuningProblem`) is the Intonato-side seam — see Intonato ≥
+its next release.
 
 On a real board, swap `MockSoc` for a `StrumentoSoc` pointed at a `strumento` device instance:
 
@@ -75,15 +86,15 @@ soc = StrumentoSoc("devices/multimode_demo/device.yaml";
 
 ## Data-provenance note
 
-Intonato's `ExperimentRecord` logging is **not** triggered inside the QILC chassis loop today
-(the chassis calls `run_experiment` with no logger, and the record's `raw` field is hardcoded
-`nothing`). So `StrumentoBackend` stashes the most recent raw IQ in `backend.last_raw`, and a
-*manual* `run_experiment(qexp, pulse; logger=…)` logs measurement-level records. Full
-raw-IQ-into-record provenance during closed-loop runs is a planned Intonato enhancement.
+`StrumentoBackend`'s `last_raw` stash and the `ExperimentRecord` logging discussion moved
+with the seam to Intonato (its QILC chassis calls `run_experiment` with no logger today;
+full raw-IQ-into-record provenance during closed-loop runs is a planned Intonato
+enhancement).
 
 ## Status
 
-Interface-complete with a tested mock loop (38 tests). The real-board `StrumentoSoc`
+Interface-complete with a tested pure-Julia mock suite. The real-board `StrumentoSoc`
 delegation path is validated with the QICK collaboration on hardware (it needs the Python
-`strumento` package + a board and is not exercised in CI). Calibration routines and multi-board
-orchestration are out of scope for v0.
+`strumento` package + a board and is not exercised in CI). Calibration routines, multi-board
+orchestration, and the twin core are out of scope for v0.2; the weakdeps/extensions split
+(PythonCall out of the hard deps) is a planned follow-up.

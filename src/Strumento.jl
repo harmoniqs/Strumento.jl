@@ -1,38 +1,33 @@
 """
     Strumento
 
-The Julia face of the Python **strumento** QICK tProc-v2 experiment framework, and
-Intonato's hardware backend for closed-loop optimal control (QILC).
+The Julia face of the Python **strumento** QICK tProc-v2 experiment framework — the
+standalone substrate layer (the soc registry: real/mock/twin boards).
 
 **One source of truth (option a).** The device model, pulse IR, compiler, and program
 assembly live in Python `strumento`; this package is a *binding*, not a reimplementation.
 The real-board path (`StrumentoSoc`) hands a solved pulse to Python `strumento` over
 PythonCall (`from_solution → compile → acquire → reduce`) — Julia never assembles an
-`AveragerProgramV2` itself. A pure-Julia `MockSoc` rolls the pulse through a `QuantumSystem`
-so the whole QILC→board loop runs and is tested with no Python and no hardware.
+`AveragerProgramV2` itself. A pure-Julia `MockSoc` rolls the pulse through a
+`QuantumSystem` (Piccolo-native propagation) so the whole board-free mock path runs and
+is tested with no Python and no hardware.
 
-The seam Intonato plugs into is `StrumentoBackend <: AbstractHardwareBackend`, wrapped as a
-`HardwareExperiment` by `StrumentoExperiment`.
+**The substrate stands alone (v0.2):** the dependency edge on Intonato (the loop
+chassis ABOVE this layer) is inverted — this package no longer depends on or reexports
+Intonato. Piccolo is the direct physics dependency (the lingua franca: `QuantumSystem`
+rollouts, `AbstractPulse` translation, reexported here). The closed-loop seam —
+`StrumentoBackend` / `StrumentoExperiment` — relocated to Intonato (≥ its next
+release, which depends on this package); the instrument layer no longer knows the
+calibration loop.
 """
 module Strumento
 
 using Reexport
-@reexport using Intonato
-
-# Intonato reexports Piccolo + NamedTrajectories, so AbstractPulse, sample,
-# QuantumSystem, KetTrajectory, SimulatedExperiment, MeasurementModel,
-# Measurement, run_experiment, AbstractHardwareBackend, HardwareExperiment, …
-# are all in scope here.
-using Intonato
-# The AbstractHardwareBackend contract — upload_pulse! / trigger! / readout /
-# sample_rate — is declared AND exported by Intonato; Strumento extends those
-# generics for StrumentoBackend (backend.jl) and reexports them above. The
-# explicit `import` is load-bearing: `using` alone lets a method definition
-# SILENTLY shadow the imported generic with a fresh local function object (the
-# accident this seam used to work by), while `import` makes backend.jl's methods
-# attach to Intonato's own generics — the contract Intonato documents for
-# backends ("a backend `import`s and extends them").
-import Intonato: upload_pulse!, trigger!, readout, sample_rate
+@reexport using Piccolo
+# Piccolo is the substrate's physics lingua franca — previously reached through
+# Intonato's reexports, now a direct public dependency. QuantumSystem,
+# AbstractPulse, LinearSplinePulse, sample, rollout, KetTrajectory, ket_to_iso, …
+# are all in scope here (and reexported for `using Strumento` consumers).
 using LinearAlgebra
 using PythonCall
 using TestItems
@@ -47,22 +42,13 @@ include("readout.jl")
 
 # ──── Backends ───────────────────────────────────────────────────────────────
 include("mock_soc.jl")
-include("backend.jl")
 include("strumento_soc.jl")
-
-# ──── Experiment factory ─────────────────────────────────────────────────────
-include("experiment.jl")
-
-# ──── Integration tests (mock QILC→QICK loop) ────────────────────────────────
-include("integration_test.jl")
 
 # ──── Exports ────────────────────────────────────────────────────────────────
 export AbstractSoc, MockSoc, StrumentoSoc
 export execute!, load_envelope!, play_program!, acquire, dac_rate, adc_rate
 export QickChannelMap, QickGenChannel
 export pulse_to_envelopes, QickProgram
-export iq_to_measurements
-export StrumentoBackend
-export StrumentoExperiment
+export iq_to_measurements, Measurement
 
 end # module Strumento

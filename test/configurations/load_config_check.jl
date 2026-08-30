@@ -18,17 +18,33 @@
 #   ─────────   ──────────────────────────────────────     ─────────────────────────────────
 #   base        NO Piccolo, NO PythonCall (the board-lane  the manifest carries neither
 #               guarantee)                                 trigger; `using Strumento` loads;
-#                                                         contract + twin surface present;
-#                                                         extension surfaces absent; the
-#                                                         base testitems pass
-#   piccolo     Piccolo ONLY (no PythonCall)               the mock/translation surface
-#                                                         appears; the delegation soc does
-#                                                         not; the golden pin passes
-#   pythoncall  PythonCall ONLY (no Piccolo)               the delegation soc appears; the
-#                                                         mock/translation surface does not
+#                                                         the base surface (contract +
+#                                                         translation data + twins) present;
+#                                                         extension types absent; the base
+#                                                         testitems pass
+#   piccolo     Piccolo ONLY (no PythonCall)               the mock type + the typed
+#                                                         translation/seam methods appear
+#                                                         (via the extension); the
+#                                                         delegation soc does not; the
+#                                                         golden pin passes
+#   pythoncall  PythonCall ONLY (no Piccolo)               the delegation soc appears (via
+#                                                         the extension); the mock type and
+#                                                         the typed methods do not
+#
+# Extension access semantics (Julia 1.12): extension exports never surface on
+# the parent module — extension-defined types are reached through
+# `Base.get_extension`, and the duck-typed verbs base declares dispatch to
+# the extension's typed methods when loaded.
 #
 # Exit code 0 = the configuration holds; nonzero otherwise (each violated
 # assertion is printed).
+
+# Isolate the load path to THIS environment (plus stdlibs): a dev machine's
+# global default environment (@v#.#) stacked behind the active project leaks
+# packages (Piccolo via the global env, even when the manifest carries no
+# weakdep) and poisons the configuration under test. The deployment reality —
+# a consumer's project environment — has a clean load path by construction.
+push!(empty!(LOAD_PATH), "@", "@stdlib")
 
 using Pkg
 using UUIDs
@@ -48,14 +64,19 @@ function check(cond::Bool, msg::AbstractString)
     return cond
 end
 
-# The names the BASE package must export (the soc contract + the readout
-# conversion + the twin core) — every configuration, no triggers needed.
+# The names the BASE package must export (the soc contract + the translation
+# data contract + the readout conversion + the twin core) — every
+# configuration, no triggers needed. `pulse_to_envelopes` is a duck-typed stub
+# in base: defined everywhere, dispatches to the Piccolo extension's typed
+# method when Piccolo is loaded.
 const BASE_SURFACE = [
     # the soc contract
     :AbstractSoc, :execute!, :load_envelope!, :play_program!, :acquire,
     :dac_rate, :adc_rate,
     # the channel map (device policy)
     :QickChannelMap, :QickGenChannel,
+    # the translation data contract + the duck-typed verb
+    :QickProgram, :pulse_to_envelopes,
     # readout conversion
     :Measurement, :iq_to_measurements,
     # twin core: drift
@@ -67,10 +88,10 @@ const BASE_SURFACE = [
     :DigitalTwin, :instantiate, :believed, :advance!, :calibrate!,
 ]
 
-# Names owned by the two package extensions — present exactly when the
-# extension is loaded.
-const PICCOLO_EXT_SURFACE = [:MockSoc, :pulse_to_envelopes, :QickProgram, :populations]
-const PYTHONCALL_EXT_SURFACE = [:StrumentoSoc]
+# Types DEFINED by the two package extensions — reachable through
+# `Base.get_extension` exactly when the trigger is loaded.
+const PICCOLO_EXT_TYPES = [:MockSoc]
+const PYTHONCALL_EXT_TYPES = [:StrumentoSoc]
 
 """Build the scratch environment for `mode`: dev the repo, add the runner deps
 the testitems need, and (for the trigger modes) add the one trigger package."""
@@ -104,10 +125,10 @@ function check_manifest(mode::String)
     return deps
 end
 
-"""Load Strumento (plus the mode's trigger, loaded FIRST so the extension's
-exports are captured by `using Strumento`) into Main. The actual checks run
-through `Base.invokelatest` — the packages are loaded in a newer world than
-this script's frames."""
+"""Load Strumento (plus the mode's trigger, loaded FIRST so the extension
+attaches under it) into Main. The actual checks run through
+`Base.invokelatest` — the packages are loaded in a newer world than this
+script's frames."""
 function load_packages(mode::String)
     if mode == "piccolo"
         Base.eval(Main, :(using Piccolo))
@@ -132,48 +153,80 @@ function check_phase(mode::String)
     pythoncall_ext = Base.get_extension(M, :StrumentoPythonCallExt)
 
     if mode == "base"
-        for name in PICCOLO_EXT_SURFACE
-            check(!isdefined(M, name), "no Piccolo extension surface: $name absent")
+        for name in PICCOLO_EXT_TYPES
+            check(!isdefined(M, name), "no Piccolo extension type: $name absent from Strumento")
         end
-        for name in PYTHONCALL_EXT_SURFACE
-            check(!isdefined(M, name), "no PythonCall extension surface: $name absent")
+        for name in PYTHONCALL_EXT_TYPES
+            check(!isdefined(M, name), "no PythonCall extension type: $name absent from Strumento")
         end
         check(piccolo_ext === nothing, "StrumentoPiccoloExt not loaded")
         check(pythoncall_ext === nothing, "StrumentoPythonCallExt not loaded")
+        # The duck-typed translation verb stubs actionably for anything that
+        # is not a Piccolo AbstractPulse (in particular: without Piccolo, for
+        # everything).
+        stub_errors = try
+            M.pulse_to_envelopes("duck pulse", nothing, 0.0, [0])
+            false
+        catch e
+            e isa ErrorException && occursin("Piccolo extension", e.msg)
+        end
+        check(stub_errors,
+              "pulse_to_envelopes stub errors actionably (no typed method loaded)")
+        stub_seam = try
+            M.pulse_duration("duck pulse")
+            false
+        catch e
+            e isa ErrorException && occursin("Piccolo extension", e.msg)
+        end
+        check(stub_seam, "pulse-sampling seam errors actionably (no typed method loaded)")
     elseif mode == "piccolo"
-        for name in PICCOLO_EXT_SURFACE
-            check(isdefined(M, name), "Piccolo extension surface: $name defined on Strumento")
-        end
-        for name in PYTHONCALL_EXT_SURFACE
-            check(!isdefined(M, name), "no PythonCall extension surface: $name absent")
-        end
-        check(piccolo_ext !== nothing, "StrumentoPiccoloExt loaded")
+        check(piccolo_ext !== nothing, "StrumentoPiccoloExt loaded (extension attached)")
         check(pythoncall_ext === nothing, "StrumentoPythonCallExt not loaded")
-        # bare-name visibility: the extension's exports are visible to
-        # `using Strumento` when the trigger loaded first (zero surface loss).
-        check(isdefined(Main, :MockSoc) && isdefined(Main, :pulse_to_envelopes),
-              "extension exports visible bare after `using Piccolo; using Strumento`")
+        for name in PICCOLO_EXT_TYPES
+            check(isdefined(piccolo_ext, name), "Piccolo extension type: $name reachable via get_extension")
+        end
+        for name in PYTHONCALL_EXT_TYPES
+            check(!isdefined(M, name), "no PythonCall extension type: $name absent from Strumento")
+        end
+        P = Main.Piccolo
+        check(piccolo_ext.MockSoc <: M.AbstractSoc, "the mock soc is an AbstractSoc")
+        # the base-declared duck-typed surface gained its Piccolo methods
+        check(hasmethod(M.pulse_to_envelopes,
+                        Tuple{P.AbstractPulse, M.QickChannelMap, Float64, Vector{Int}}),
+              "pulse_to_envelopes has its AbstractPulse typed method")
+        check(hasmethod(M.pulse_duration, Tuple{P.AbstractPulse}),
+              "pulse-sampling seam has its duration method")
+        check(hasmethod(M.sample_controls, Tuple{P.AbstractPulse, Vector{Float64}}),
+              "pulse-sampling seam has its sample method")
     elseif mode == "pythoncall"
-        for name in PYTHONCALL_EXT_SURFACE
-            check(isdefined(M, name), "PythonCall extension surface: $name defined on Strumento")
-        end
-        for name in PICCOLO_EXT_SURFACE
-            check(!isdefined(M, name), "no Piccolo extension surface: $name absent")
-        end
-        check(pythoncall_ext !== nothing, "StrumentoPythonCallExt loaded")
+        check(pythoncall_ext !== nothing, "StrumentoPythonCallExt loaded (extension attached)")
         check(piccolo_ext === nothing, "StrumentoPiccoloExt not loaded")
-        check(isdefined(Main, :StrumentoSoc),
-              "delegation soc visible bare after `using PythonCall; using Strumento`")
+        for name in PYTHONCALL_EXT_TYPES
+            check(isdefined(pythoncall_ext, name), "PythonCall extension type: $name reachable via get_extension")
+        end
+        check(pythoncall_ext.StrumentoSoc <: M.AbstractSoc,
+              "the delegation soc is an AbstractSoc")
+        for name in PICCOLO_EXT_TYPES
+            check(!isdefined(M, name), "no Piccolo extension type: $name absent from Strumento")
+        end
+        # the delegation verb's method is on the base generic function
+        check(hasmethod(M.execute!, Tuple{pythoncall_ext.StrumentoSoc, Any, M.QickChannelMap,
+                                          Vector{Int}}),
+              "execute! has its delegation method (duck-typed pulse)")
     end
 
     # Run the package's testitems — all of them; the extension testitems skip
     # cleanly where their trigger is absent. TestItemRunner's root test set
-    # THROWS when the run is not green, so catch, report, and mark.
+    # THROWS when the run is not green, so catch, report, and mark. Counts:
+    # the finished root set carries its descendants in the cumulative fields.
     ok_items, msg = try
         ts = Main.TestItemRunner.run_tests(REPO)
         c = Main.Test.get_test_counts(ts)
-        (true, "testitem run green ($(c.passes) passed, $(c.fails) failed, " *
-               "$(c.errors) errored)")
+        passed = c.passes + c.cumulative_passes
+        failed = c.fails + c.cumulative_fails
+        errored = c.errors + c.cumulative_errors
+        (true, "testitem run green ($passed passed, $failed failed, " *
+               "$errored errored)")
     catch e
         (false, "testitem run not green: $(sprint(showerror, e))")
     end

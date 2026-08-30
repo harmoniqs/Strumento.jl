@@ -23,9 +23,13 @@ jobs:
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v2
-      # No Python step: the mock path runs pure-Julia. PythonCall is a dep but
-      # its interpreter is initialized lazily and never touched by the test
-      # suite (PyQickSoc is not constructed in CI).
+      # No Python step: the mock path runs pure-Julia. Piccolo and PythonCall
+      # are weakdeps (extension triggers; issue #16) injected into the test
+      # env by the [targets] `test` entry, so Pkg.test runs the full
+      # configuration here. PythonCall's interpreter is initialized lazily
+      # and never touched by the test suite (StrumentoSoc is not constructed
+      # in CI). The base-only / single-trigger configurations are checked
+      # locally by test/configurations/load_config_check.jl.
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
         with:

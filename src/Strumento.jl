@@ -44,6 +44,12 @@ include("readout.jl")
 include("mock_soc.jl")
 include("strumento_soc.jl")
 
+# ──── Digital twins (absorbed from harmoniqs/Sosia.jl) ──────────────────────
+# Drift processes, the vault twin-record loader, and the truth/belief/record
+# contract (vault spec-20260803-043304-digital-twins-sosia). Twin records are
+# vault documents: code loads records, it never owns parameters.
+include("twin_records.jl")
+
 # ──── Exports ────────────────────────────────────────────────────────────────
 export AbstractSoc, MockSoc, StrumentoSoc
 export execute!, load_envelope!, play_program!, acquire, dac_rate, adc_rate

@@ -1000,4 +1000,7 @@ end
 pulse_duration(pulse::AbstractPulse) = duration(pulse)
 sample_controls(pulse::AbstractPulse, times) = sample(pulse, times)
 
+# ──── The bosonic family (issue #21) ──────────────────────────────────────────
+include("bosonic_family.jl")
+
 end # module StrumentoPiccoloExt

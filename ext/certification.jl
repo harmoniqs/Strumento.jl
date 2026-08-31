@@ -1018,9 +1018,16 @@ end
         # Lower is better; 0 = perfect prediction; the belief is believed(twin).
 
         # (a) with belief == truth and the record's own confusion, the metric
-        # is EXACTLY zero (a fresh, unperturbed twin: belief = truth = record)
+        # VANISHES (a fresh, unperturbed twin: belief = truth = record).
+        # Cross-path computed-zero pin: the degenerate configuration drives the
+        # metric through two computation paths — belief-predicted vs twin-exact —
+        # which round differently per environment (CI run 33362176486: 1.26e-18
+        # on the runner; 0.0 locally), so bit-zero is not the claim. The metric
+        # vanishing to <1e-12 IS the vanishing: the atol sits nine orders above
+        # the observed 1.26e-18 residual and seven below any real calibration
+        # error (which lives at 1e-2..1e-4 scale).
         twin = instantiate(fixture; drift = DriftPlan(), seed = 1)
-        @test ext.calibration_transfer_metric(twin, families, meas, probes, design) == 0.0
+        @test ext.calibration_transfer_metric(twin, families, meas, probes, design) ≈ 0.0 atol = 1e-12
 
         # (b) range and sign: a WRONG belief predicts worse than truth
         twin.truth[:chi_kHz] = record.parameters["chi_kHz"] + 8.0   # drift the truth away

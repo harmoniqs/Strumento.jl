@@ -662,6 +662,62 @@ end
     end
 end
 
+@testitem "TwinSoc response: confusion + binomial shots at the expected statistics (seeded)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using Statistics
+        TwinSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).TwinSoc
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) = QuantumSystem(truth[:omega] * σz, [σx, σx],
+                                          [truth[:drive_bound], truth[:drive_bound]])
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+        twin = instantiate(fixture; drift = DriftPlan(), seed = 0xBEEF)
+        soc = TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                      families = Dict("toy" => toy_family),
+                      shots = 512, dac_rate = 20.0)
+
+        # the fixed golden pulse (the MockSoc golden fixture's shape)
+        N = 11; T = 5.0
+        times = collect(range(0.0, T, length = N))
+        vals = 0.1 .* permutedims(hcat(sin.(range(0.0, 2.4π, length = N)),
+                                       cos.(range(0.3π, 1.7π, length = N))))
+        pulse = LinearSplinePulse(vals, times)
+        map = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1, q_drive = 2)]; n_drives = 2)
+
+        # The exact response for THIS pulse at the final knot, captured from the
+        # DIRECT Piccolo rollout + the record's confusion before implementation:
+        # q = Cᵀ p, p = [0.9552991750369558, 0.044700824963045074].
+        q = [0.9379812245347385, 0.06201877546526239]
+
+        K = 40
+        freq0 = Float64[]
+        for _ in 1:K
+            blob = execute!(soc, pulse, map, [101])[1]
+            r = real.(blob)
+            # a sampled blob IS shot counts / shots: exact dyadic multiples of 1/512
+            @test all(x -> 512 * x == round(Int, 512 * x), r)
+            @test sum(r) == 1.0
+            push!(freq0, r[1])
+        end
+
+        σ = sqrt(q[1] * (1 - q[1]) / soc.shots)          # binomial(512, q) per-acquire std
+        σ_mean = σ / sqrt(K)                              # std of the K-average
+
+        # the empirical mean centers on the exact response (the confusion remap)
+        @test abs(mean(freq0) - q[1]) < 4 * σ_mean
+        # the deviation's SCALE matches binomial(shots, q) — not just its center
+        @test std(freq0) ≈ σ rtol = 0.25
+        # imperfect by construction: every seeded blob deviates from the exact
+        # response, and stays within binomial bounds
+        @test all(f -> f != q[1], freq0)
+        @test all(f -> abs(f - q[1]) < 5σ, freq0)
+    end
+end
+
 @testitem "Piccolo extension surface: typed methods + the mock type reachable" begin
     using Strumento
     if Base.identify_package("Piccolo") === nothing

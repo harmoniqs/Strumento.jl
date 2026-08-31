@@ -579,6 +579,89 @@ end
     end
 end
 
+@testitem "TwinSoc validates its seams with actionable errors" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using LinearAlgebra
+        TwinSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).TwinSoc
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) = QuantumSystem(truth[:omega] * σz, [σx, σx],
+                                          [truth[:drive_bound], truth[:drive_bound]])
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+
+        # ── the record's confusion must be present and well-formed ──
+        dir = mktempdir()
+        function bad_record(name, noise_yaml)
+            path = joinpath(dir, name)
+            write(path, "---\ntype: device-twin\nid: bad-$name\nfamily: toy\n" *
+                        "parameters:\n  omega: 1.0\n  drive_bound: 1.0\n" * noise_yaml *
+                        "---\n# body\n")
+            return path
+        end
+        cases = [
+            ("no-noise.md",        "",                                                    "readout_confusion"),
+            ("no-key.md",          "noise:\n  T1_us: {value: 65.0, estimate: true}\n",     "readout_confusion"),
+            ("bare-matrix.md",     "noise:\n  readout_confusion: [[0.9, 0.1], [0.2, 0.8]]\n", "wrapped"),
+            ("no-value-key.md",    "noise:\n  readout_confusion: {estimate: true}\n",       "value"),
+            ("non-square.md",      "noise:\n  readout_confusion: {value: [[0.9, 0.1], [0.2]]}\n", "square"),
+            ("row-sums.md",        "noise:\n  readout_confusion: {value: [[0.9, 0.2], [0.1, 0.8]]}\n", "row"),
+            ("negative.md",        "noise:\n  readout_confusion: {value: [[1.1, -0.1], [0.0, 1.0]]}\n", "≥ 0"),
+        ]
+        for (name, noise_yaml, needle) in cases
+            local twin = instantiate(bad_record(name, noise_yaml); drift = DriftPlan(), seed = 1)
+            local err = try
+                TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                        families = Dict("toy" => toy_family)); nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin(needle, sprint(showerror, err))
+        end
+
+        # ── family dispatch: a record family with no builder is named loudly ──
+        twin = instantiate(fixture; drift = DriftPlan(), seed = 1)
+        err = try
+            TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                    families = Dict("other" => toy_family)); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        msg = sprint(showerror, err)
+        @test occursin("toy", msg)          # the record's family, named
+        @test occursin("other", msg)        # the known families, listed
+
+        # ── shots / dt bounds ──
+        @test_throws ErrorException TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                                            families = Dict("toy" => toy_family), shots = 0)
+        @test_throws ErrorException TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                                            families = Dict("toy" => toy_family), dt = -1.0)
+
+        # ── the confusion must match the measurement dimension (at respond time) ──
+        # a 3-level builder against the toy record's 2×2 confusion
+        σx3 = zeros(ComplexF64, 3, 3); σx3[1, 2] = σx3[2, 1] = 1.0
+        big_family(truth) = QuantumSystem(truth[:omega] * diagm([1.0, 0.0, -1.0]),
+                                          [σx3], [truth[:drive_bound]])
+        soc3 = TwinSoc(twin, ComplexF64[1, 0, 0], ComplexF64[0, 0, 1];
+                       families = Dict("toy" => big_family), exact = true, dac_rate = 20.0)
+        N = 11
+        pulse = LinearSplinePulse(0.1 .* randn(1, N), collect(range(0.0, 5.0, length = N)))
+        map = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1)]; n_drives = 1)
+        err = try
+            execute!(soc3, pulse, map, [N]); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("measurement dimension", sprint(showerror, err))
+    end
+end
+
 @testitem "Piccolo extension surface: typed methods + the mock type reachable" begin
     using Strumento
     if Base.identify_package("Piccolo") === nothing

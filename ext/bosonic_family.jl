@@ -193,3 +193,64 @@ export bosonic_system_builder
         @test L_transmon[idx(7, 1), idx(7, 2)] ≈ sqrt(γ) atol = 1e-15
     end
 end
+
+@testitem "bosonic family — the Hamiltonian matches the dispersive closed form (units and frame pinned)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using Strumento: DriftPlan, instantiate, load_record
+        using LinearAlgebra
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "bosonic.md")
+        twin = instantiate(fixture; drift = DriftPlan(), seed = 1)
+        sys = ext.bosonic_system_builder(twin.record)(twin.truth)
+
+        # the record's symbols in model units (the factory's documented table)
+        χ  = 2π * twin.truth[:chi_kHz] * 1e-6     # kHz → rad·GHz
+        α_c = 2π * twin.truth[:K_c_kHz] * 1e-6
+        α_q = 2π * twin.truth[:K_q_GHz]
+        χ_p = 2π * twin.truth[:chi_p_kHz] * 1e-6
+
+        idx(n, m) = (n - 1) * 2 + m               # cavity ⊗ transmon, 1-based
+        H = sys.H_drift
+
+        # closed form: E(n, m) = χ(n−1)(m−1) + (α_c/2)(n−1)(n−2) + (α_q/2)(m−1)(m−2)
+        # + χ′(n−1)(n−2)(m−1) — the rotating frame absorbs the bare frequencies,
+        # so H_drift is DIAGONAL and the record's dispersive shift reads off it.
+        @test norm(Matrix(H) - diagm(diag(H))) < 1e-15
+        @test H[idx(1, 1), idx(1, 1)] ≈ 0.0 atol = 1e-15
+        # the cavity transition shifts by χ per transmon excitation — the
+        # record's dispersive shift, at its kHz magnitude and sign
+        @test H[idx(2, 2), idx(2, 2)] ≈ χ
+        @test H[idx(2, 2), idx(2, 2)] - H[idx(2, 1), idx(2, 1)] ≈ 2π * (-298.4e-6)
+        # the transmon transition shifts by χ per cavity photon: the one-photon
+        # transmon pull minus the zero-photon pull
+        @test (H[idx(2, 2), idx(2, 2)] - H[idx(2, 1), idx(2, 1)]) -
+              (H[idx(1, 2), idx(1, 2)] - H[idx(1, 1), idx(1, 1)]) ≈ χ
+        # two photons: the cavity self-Kerr enters the ladder (spacings shrink
+        # by |α_c| per photon) on top of the doubled dispersive pull
+        @test H[idx(3, 2), idx(3, 2)] ≈ 2χ + α_c
+        @test H[idx(3, 1), idx(3, 1)] ≈ α_c
+
+        # N_transmon = 2: the α_q (anharmonicity) and χ′ terms are structurally
+        # zero on a 2-level ancilla — the documented level-count convention.
+        # (A 3-level record would see (α_q/2)q†²q²; the record's intent is a
+        # qubit-only ancilla.)
+        @test H[idx(1, 1), idx(1, 1)] ≈ 0.0 atol = 1e-15   # no q†q bare term in frame
+
+        # the four drives are the transmon and cavity quadratures (the bosonic
+        # skill's 4 control channels), in the documented order:
+        # transmon I, transmon Q, cavity I, cavity Q — Hermitian, unit-bounded.
+        @test sys.n_drives == 4
+        @test all(b -> b == (-1.0, 1.0), sys.drive_bounds)   # v1 unit placeholder
+        D = [drive_matrix(d) for d in sys.H_drives]
+        @test all(d -> ishermitian(d), D)
+        @test D[1][idx(1, 1), idx(1, 2)] ≈ 0.5              # transmon I: (q+q†)/2
+        @test D[2][idx(1, 1), idx(1, 2)] ≈ -0.5im           # transmon Q: i(q†−q)/2
+        @test D[3][idx(1, 1), idx(2, 1)] ≈ 0.5              # cavity I: (a+a†)/2
+        @test D[4][idx(1, 1), idx(2, 1)] ≈ -0.5im           # cavity Q: i(a†−a)/2
+    end
+end

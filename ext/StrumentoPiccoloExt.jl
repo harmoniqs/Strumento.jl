@@ -1025,4 +1025,7 @@ sample_controls(pulse::AbstractPulse, times) = sample(pulse, times)
 # ──── The bosonic family (issue #21) ──────────────────────────────────────────
 include("bosonic_family.jl")
 
+# ──── Certification gates (issue #22) ────────────────────────────────────────
+include("certification.jl")
+
 end # module StrumentoPiccoloExt

@@ -32,7 +32,8 @@ import Strumento: AbstractSoc, execute!, load_envelope!, play_program!, acquire,
     pulse_to_envelopes,                 # the base verb: typed method added below
     QickProgram,                        # the base data contract: filled here
     pulse_duration, sample_controls,    # the pulse-sampling seam (typed methods below)
-    DigitalTwin                         # the twin the soc face wraps (issue #20)
+    DigitalTwin,                        # the twin the soc face wraps (issue #20)
+    advance!                            # the drift advance the soc wires per acquire
 using TestItems
 
 using Piccolo
@@ -508,8 +509,15 @@ function acquire(soc::TwinSoc, _ro_chs)
     system = soc.system_builder(soc.twin.truth)
     qtraj = KetTrajectory(system, recon, soc.ψ_init, soc.ψ_goal)
     knot_times = get_knot_times(recon)
-    return [_respond(soc, soc.measurement_fn(ket_to_iso(qtraj(knot_times[k]))))
-            for k in prog.indices]
+    blobs = [_respond(soc, soc.measurement_fn(ket_to_iso(qtraj(knot_times[k]))))
+             for k in prog.indices]
+    # Drift (advance-after, documented in the docstring): the acquire measures
+    # the truth as it stands, THEN ages it by dt — acquire k measures truth at
+    # twin-time (k-1)·dt; the first acquire sees the record's pristine truth.
+    # dt = 0 (the default) skips the advance entirely: no drift draws consumed,
+    # no scheduled jumps fired — static truth.
+    soc.dt > 0 && advance!(soc.twin, soc.dt)
+    return blobs
 end
 
 @testitem "TwinSoc executes the soc verbs over the twin's current truth (family seam)" begin
@@ -715,6 +723,69 @@ end
         # response, and stays within binomial bounds
         @test all(f -> f != q[1], freq0)
         @test all(f -> abs(f - q[1]) < 5σ, freq0)
+    end
+end
+
+@testitem "TwinSoc drift: nonzero dt evolves truth between acquires; default static" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        TwinSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).TwinSoc
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) = QuantumSystem(truth[:omega] * σz, [σx, σx],
+                                          [truth[:drive_bound], truth[:drive_bound]])
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+        N = 11; T = 5.0
+        times = collect(range(0.0, T, length = N))
+        vals = 0.1 .* permutedims(hcat(sin.(range(0.0, 2.4π, length = N)),
+                                       cos.(range(0.3π, 1.7π, length = N))))
+        pulse = LinearSplinePulse(vals, times)
+        map = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1, q_drive = 2)]; n_drives = 2)
+
+        # advance-after semantics: acquire k measures truth at (k-1)·dt — the
+        # FIRST acquire sees the record's pristine truth. Ramp(0.1/day), dt = 1.
+        plan = DriftPlan(:omega => [Ramp(rate = 0.1)])
+        twin = instantiate(fixture; drift = plan, seed = 0xC0FFEE)
+        soc = TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                      families = Dict("toy" => toy_family),
+                      exact = true, dt = 1.0, dac_rate = 20.0)
+
+        blob1 = execute!(soc, pulse, map, [11])[1]
+        blob2 = execute!(soc, pulse, map, [11])[1]
+
+        # acquire 1 measures the PRISTINE record truth — captured direct values
+        @test blob1 == [ComplexF64(0.9788483456466464 + 0.0im),
+                        ComplexF64(0.021151654353354598 + 0.0im)]
+        # acquire 2 measures truth aged one dt (ω = 1.0 + 0.1·1.0) — captured
+        @test blob2 == [ComplexF64(0.9788684314249929 + 0.0im),
+                        ComplexF64(0.021131568575006088 + 0.0im)]
+        # drift is real: consecutive acquires against the SAME pulse differ
+        @test blob1 != blob2
+        # the twin's clock advanced once per acquire
+        @test soc.twin.t == 2.0
+        # drift moved truth (two advances: 1.0 → 1.1 → 1.1+0.1), never belief —
+        # the core invariant (≈: the Ramp ladder's float arithmetic)
+        @test soc.twin.truth[:omega] ≈ 1.2
+        @test believed(soc.twin)["omega"] == 1.0
+
+        # dt defaults to STATIC (zero): a drift plan is installed, but the
+        # advance is SKIPPED entirely — a jump scheduled at t = 0 must not
+        # fire on every acquire — so consecutive acquires are identical and
+        # the clock never moves.
+        jump_plan = DriftPlan(:omega => [JumpSchedule(times = [0.0], deltas = [0.5])])
+        twin0 = instantiate(fixture; drift = jump_plan, seed = 0xC0FFEE)
+        soc0 = TwinSoc(twin0, ComplexF64[1, 0], ComplexF64[0, 1];
+                       families = Dict("toy" => toy_family), exact = true, dac_rate = 20.0)
+        b1 = execute!(soc0, pulse, map, [11])[1]
+        b2 = execute!(soc0, pulse, map, [11])[1]
+        b3 = execute!(soc0, pulse, map, [11])[1]
+        @test b1 == b2 && b2 == b3
+        @test b1 == blob1                    # static == the pristine golden
+        @test soc0.twin.t == 0.0             # the clock never moved
+        @test soc0.twin.truth[:omega] == 1.0  # the scheduled jump never fired
     end
 end
 

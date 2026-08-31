@@ -860,6 +860,78 @@ end
     end
 end
 
+@testitem "TwinSoc replay: identical seeds → identical sequences bit-exact (drift + shots)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        TwinSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).TwinSoc
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) = QuantumSystem(truth[:omega] * σz, [σx, σx],
+                                          [truth[:drive_bound], truth[:drive_bound]])
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+        plan = DriftPlan(:omega => [OrnsteinUhlenbeck(theta = 0.1, sigma = 0.2, mu = 1.0)])
+        N = 11; T = 5.0
+        times = collect(range(0.0, T, length = N))
+        vals = 0.1 .* permutedims(hcat(sin.(range(0.0, 2.4π, length = N)),
+                                       cos.(range(0.3π, 1.7π, length = N))))
+        pulse = LinearSplinePulse(vals, times)
+        map = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1, q_drive = 2)]; n_drives = 2)
+
+        # the full stochastic path: OU drift ON (dt = 1), shot sampling ON
+        # (64 shots), two knots per acquire, six acquires. FRESH process
+        # objects each call — replay must not depend on shared state.
+        function replay(seed)
+            twin = instantiate(fixture; drift = plan, seed = seed)
+            soc = TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                          families = Dict("toy" => toy_family),
+                          shots = 64, dt = 1.0, dac_rate = 20.0)
+            omegas = Float64[]
+            blobs = Vector{Vector{ComplexF64}}[]
+            for _ in 1:6
+                push!(blobs, execute!(soc, pulse, map, [11, 101]))
+                push!(omegas, soc.twin.truth[:omega])
+            end
+            return omegas, blobs
+        end
+
+        # same seed → identical, always (fresh twins, fresh rngs, fresh socs)
+        o1, b1 = replay(0x5EED)
+        o2, b2 = replay(0x5EED)
+        @test o1 == o2
+        @test b1 == b2
+        # different seed → a different measurement sequence
+        o3, b3 = replay(0xFEED)
+        @test o3 != o1
+        @test b3 != b1
+
+        # GOLDEN PIN — captured from the implemented rng-draw contract (the
+        # ONE stochastic source drives shot uniforms and OU drift draws
+        # interleaved: per acquire [shots: knots in order, shots in order]
+        # then [drift: plan order]; the deterministic pieces were captured
+        # pre-implementation in the drift and equivalence pins). `==`, no
+        # tolerance: any deviation is a behavior change, never noise.
+        @test o1 == [1.0037869394647132, 0.8864476509337655, 1.0193670001043336,
+                     0.907558804064814, 1.004616903851481, 0.9007921139196429]
+        @test b1 == [
+            [ComplexF64[0.96875 + 0.0im, 0.03125 + 0.0im],
+             ComplexF64[0.96875 + 0.0im, 0.03125 + 0.0im]],
+            [ComplexF64[0.953125 + 0.0im, 0.046875 + 0.0im],
+             ComplexF64[0.953125 + 0.0im, 0.046875 + 0.0im]],
+            [ComplexF64[0.984375 + 0.0im, 0.015625 + 0.0im],
+             ComplexF64[0.9375 + 0.0im, 0.0625 + 0.0im]],
+            [ComplexF64[0.96875 + 0.0im, 0.03125 + 0.0im],
+             ComplexF64[0.96875 + 0.0im, 0.03125 + 0.0im]],
+            [ComplexF64[0.984375 + 0.0im, 0.015625 + 0.0im],
+             ComplexF64[0.859375 + 0.0im, 0.140625 + 0.0im]],
+            [ComplexF64[1.0 + 0.0im, 0.0 + 0.0im],
+             ComplexF64[0.9375 + 0.0im, 0.0625 + 0.0im]],
+        ]
+    end
+end
+
 @testitem "Piccolo extension surface: typed methods + the mock type reachable" begin
     using Strumento
     if Base.identify_package("Piccolo") === nothing

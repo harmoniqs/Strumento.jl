@@ -151,6 +151,82 @@ end
 
 export bosonic_system_builder
 
+"""
+    bosonic_ancilla_populations(n_transmon, n_fock) -> (iso_state) -> Vector{Float64}
+
+The bosonic family's **default measurement path**: the transmon-ancilla
+populations, **marginalized over the cavity** (the cavity is traced out),
+from the iso-packed state a `TwinSoc` hands its `measurement_fn`.
+
+# The subspace convention (why the record's confusion is 2×2 against a
+# joint N_transmon × N_fock system)
+
+Dispersive readout of the Stanford-class device distinguishes the **transmon
+ancilla state** — the measurement tone probes the cavity, whose frequency the
+ancilla pulls by χ — so the record's `noise.readout_confusion` is
+`N_transmon × N_transmon` (2×2 for the record's qubit-only ancilla) and
+operates on the ancilla marginal: `p[i] = Σ_fock ⟨fock, i|ρ|fock, i⟩`. The
+joint cavity populations never reach the confusion. For `N_transmon = 2` this
+marginal is the full trace (a valid probability vector exactly); for a
+3+ level ancilla the leaked populations sit OUTSIDE the 2×2 confusion model
+and `TwinSoc._respond` errors loudly on the length mismatch — a 3-outcome
+readout would need a 3×3 record confusion (out of scope: v1 readout models
+are exactly what the record carries).
+
+# State forms
+
+`TwinSoc` hands the measurement function the iso-packed propagation state,
+which by rollout kind is either:
+
+- a **ket** (`ket_to_iso(ψ)`, length `2d`, closed `KetTrajectory` rollouts), or
+- a **vectorized density matrix** (`ket_to_iso(vec(ρ))`, length `2d²`,
+  `DensityTrajectory` rollouts — what `bosonic_system_builder`'s
+  `OpenQuantumSystem` triggers),
+
+with `d = n_transmon × n_fock`. The closure dispatches on the input length —
+the two are unambiguous for every `d ≥ 2` — so one family measurement function
+serves both rollout kinds. A mixed state reduces by its diagonal only: no
+coherence term leaks into a population measurement.
+"""
+function bosonic_ancilla_populations(n_transmon::Integer, n_fock::Integer)
+    d = n_transmon * n_fock
+    d ≥ 2 || error(
+        "bosonic family: the joint dimension must be ≥ 2 (got $d from " *
+        "$n_transmon transmon × $n_fock fock levels)")
+    return function (iso_state::AbstractVector{<:Real})
+        n = length(iso_state)
+        (n == 2 * d || n == 2 * d^2) || error(
+            "bosonic family: the ancilla measurement expects an iso-packed " *
+            "ket (length $(2d)) or vectorized density matrix (length $(2 * d^2)); " *
+            "got length $n")
+        d2 = d * d
+        joint = Vector{Float64}(undef, d)
+        if n == 2 * d2
+            # density form (density_to_iso_vec(ρ) = ket_to_iso(vec(ρ)),
+            # column-major): ρ_ii sits at iso position (i−1)·d + i. A physical
+            # ρ has a real diagonal; the imaginary slot is its residue.
+            for i in 1:d
+                joint[i] = Float64(iso_state[(i - 1) * d + i])
+            end
+        else
+            # ket form: |ψ|² per joint level
+            for i in 1:d
+                re, im_ = iso_state[i], iso_state[d + i]
+                joint[i] = re^2 + im_^2
+            end
+        end
+        # cavity-major basis: index i ↦ (fock, transmon) with transmon minor —
+        # sum the fock axis. The ancilla marginal, in transmon-level order.
+        p = zeros(Float64, n_transmon)
+        for i in 1:d
+            p[((i - 1) % n_transmon) + 1] += joint[i]
+        end
+        return p
+    end
+end
+
+export bosonic_ancilla_populations
+
 @testitem "bosonic family — the factory turns the record's truth into a decay-carrying system (no hand-passed parameters)" begin
     using Strumento
     if Base.identify_package("Piccolo") === nothing
@@ -350,5 +426,54 @@ end
         end
         @test err isa ErrorException
         @test occursin("N_transmon", sprint(showerror, err))
+    end
+end
+
+@testitem "bosonic family — the ancilla measurement path: transmon populations marginalized over the cavity (both state forms)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using Strumento: DriftPlan, instantiate
+        using LinearAlgebra
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        twin = instantiate(joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "bosonic.md");
+                           drift = DriftPlan(), seed = 1)
+        n_t = Int(twin.truth[:N_transmon])
+        n_f = Int(twin.truth[:N_fock])
+        idx(n, m) = (n - 1) * n_t + m
+
+        meas = ext.bosonic_ancilla_populations(n_t, n_f)
+        @test meas isa Function
+
+        # a state spread over the joint space: |e,0⟩ ⊕ |g,7⟩ ⊕ |e,3⟩
+        ψ = zeros(ComplexF64, n_t * n_f)
+        ψ[idx(1, 2)] = 0.8                        # |e,0⟩
+        ψ[idx(8, 1)] = 0.6im                      # |g,7⟩
+        ψ[idx(4, 2)] = 0.0 + 0im                  # zero amp: only pins the shape
+
+        # ket form (closed rollouts): the ancilla marginal, cavity traced out
+        @test meas(ket_to_iso(ψ)) ≈ [0.6^2, 0.8^2] atol = 1e-15
+        # density form (decay rollouts): the SAME marginal from vec(ρ) — the
+        # measurement contract is form-polymorphic on the iso-packed state
+        ρ = ψ * ψ'
+        @test meas(ket_to_iso(vec(ρ))) ≈ [0.6^2, 0.8^2] atol = 1e-15
+
+        # a genuinely mixed state reduces by its diagonal only (no coherence
+        # terms leak into a population measurement)
+        ρ_mix = zeros(ComplexF64, n_t * n_f, n_t * n_f)
+        ρ_mix[idx(1, 1), idx(1, 1)] = 0.25          # |g,0⟩
+        ρ_mix[idx(1, 2), idx(1, 2)] = 0.75          # |e,0⟩
+        ρ_mix[idx(1, 1), idx(1, 2)] = 0.3im          # g-e coherence — ignored
+        @test meas(ket_to_iso(vec(ρ_mix))) ≈ [0.25, 0.75] atol = 1e-15
+
+        # the input form is unambiguous (2d vs 2d²) and a wrong length errors
+        @test_throws ErrorException meas(zeros(n_t * n_f + 1))
+
+        # the length the soc's confusion expects: the TRANSMON dim, not the
+        # joint dim — the record's 2×2 confusion matches this marginal
+        @test length(meas(ket_to_iso(ψ))) == n_t
     end
 end

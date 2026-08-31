@@ -789,6 +789,77 @@ end
     end
 end
 
+@testitem "TwinSoc exact mode == direct QuantumSystem rollout (equivalence, golden)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using Piccolo.Quantum.Pulses: get_knot_times
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        TwinSoc = ext.TwinSoc
+        populations = ext.populations
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) = QuantumSystem(truth[:omega] * σz, [σx, σx],
+                                          [truth[:drive_bound], truth[:drive_bound]])
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+        # drift OFF (empty plan; dt defaults to 0) + exact response
+        twin = instantiate(fixture; drift = DriftPlan(), seed = 0xC0FFEE)
+        soc = TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                      families = Dict("toy" => toy_family),
+                      exact = true, dac_rate = 20.0)
+
+        N = 11; T = 5.0
+        times = collect(range(0.0, T, length = N))
+        vals = 0.1 .* permutedims(hcat(sin.(range(0.0, 2.4π, length = N)),
+                                       cos.(range(0.3π, 1.7π, length = N))))
+        pulse = LinearSplinePulse(vals, times)
+        map = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1, q_drive = 2)]; n_drives = 2)
+        indices = [11, 101]
+
+        raw = execute!(soc, pulse, map, indices)
+
+        # (a) GOLDEN PIN — captured from the DIRECT Piccolo rollout (same
+        # system from the record's pristine truth, same played pulse, same
+        # measurement function) + the record's confusion, BEFORE TwinSoc was
+        # implemented. `==`, no tolerance: a deviation is a behavior change.
+        @test raw == [ComplexF64[0.9788483456466464 + 0.0im, 0.021151654353354598 + 0.0im],
+                      ComplexF64[0.9379812245347385 + 0.0im, 0.06201877546526239 + 0.0im]]
+
+        # (b) the direct forward model computed HERE from public pieces — the
+        # same translation, the same played-pulse reconstruction, the same
+        # rollout, the same measurement function, the same confusion remap.
+        prog = pulse_to_envelopes(pulse, map, 20.0, indices)
+        ctrls = zeros(Float64, prog.n_drives, length(prog.times))
+        for (gen_ch, i_drive, q_drive) in prog.routing
+            idata, qdata = prog.envelopes[gen_ch]
+            ctrls[i_drive, :] .= idata
+            q_drive === nothing || (ctrls[q_drive, :] .= qdata)
+        end
+        recon = LinearSplinePulse(ctrls, prog.times)
+        direct = KetTrajectory(toy_family(twin.truth), recon,
+                               ComplexF64[1, 0], ComplexF64[0, 1])
+        kt = get_knot_times(recon)
+        rows = twin.record.noise["readout_confusion"]["value"]
+        C = Matrix{Float64}([rows[i][j] for i in eachindex(rows), j in eachindex(rows)])
+        confuse(p) = [sum(C[i, j] * p[i] for i in eachindex(p)) for j in eachindex(p)]
+        expected = [ComplexF64.(confuse(populations(ket_to_iso(direct(kt[k])))))
+                    for k in indices]
+        @test raw == expected
+
+        # (c) the degenerate-twin relationship, demonstrated (not re-derived):
+        # the direct rollout's RAW populations are bit-exact MockSoc's
+        # existing golden blobs — its pinned forward model on this very pulse
+        # and system shape. TwinSoc with an identity confusion and dt = 0
+        # would BE MockSoc; the confusion is the only difference.
+        pops11 = populations(ket_to_iso(direct(kt[11])))
+        pops101 = populations(ket_to_iso(direct(kt[101])))
+        @test pops11 == [0.9987748357943047, 0.0012251642056963555]
+        @test pops101 == [0.9552991750369558, 0.044700824963045074]
+    end
+end
+
 @testitem "Piccolo extension surface: typed methods + the mock type reachable" begin
     using Strumento
     if Base.identify_package("Piccolo") === nothing

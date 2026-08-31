@@ -39,4 +39,8 @@ tags: [device-twin, bosonic, fixture]
 A test fixture in the bosonic seed family's shape: transmon ancilla dispersively
 coupled to a storage cavity, GKP rehearsal as the target campaign. Every value
 is synthetic — this record exists to pin the loader's schema, never to model a
-device.
+device. The values are snapshot-representative of the vault model-of-lab
+bosonic record's magnitudes (χ ≈ −300 kHz class, 2-level ancilla, ~1 μs-class
+cavity lifetime placeholders); the vault record GOVERNS the family factory's
+semantics (units and conventions), so factory conventions must be re-checked
+against it if it moves.

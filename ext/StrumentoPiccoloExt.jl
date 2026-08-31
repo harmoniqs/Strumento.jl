@@ -347,8 +347,13 @@ The forward model per acquire:
 1. **Roll the CURRENT-truth system** — `families[twin.record.family]` builds a
    `QuantumSystem` from `twin.truth` as it stands for THIS acquire (drifted
    truth is therefore felt exactly when it has evolved). The played pulse is
-   reconstructed from the loaded envelopes exactly the way `MockSoc` does, and
-   propagated with Piccolo-native `KetTrajectory` propagation.
+   reconstructed from the loaded envelopes exactly the way `MockSoc` does.
+   Rollout kind follows the built system: a closed `QuantumSystem` propagates
+   with Piccolo-native `KetTrajectory` propagation; an `OpenQuantumSystem`
+   (a family builder carrying decay — e.g. the bosonic family's κ/T1) rolls
+   the **Lindblad master equation** (`DensityTrajectory`), and the measurement
+   function receives the iso-packed vectorized density matrix
+   (`density_to_iso_vec`) instead of the iso-packed ket.
 2. **Response** — the measurement function (default `populations`) maps the
    rolled-out state to a probability vector `p`; the record's readout
    confusion matrix remaps it (`q = Cᵀ p` — rows of `C` are the TRUE state's
@@ -520,12 +525,29 @@ function acquire(soc::TwinSoc, _ro_chs)
     end
     recon = LinearSplinePulse(ctrls, prog.times)
     # Roll the CURRENT-truth system: the family builder consumes the twin's
-    # truth as it stands for THIS acquire.
+    # truth as it stands for THIS acquire. Two rollout kinds by the built
+    # system's type (issue #21, the decay seam):
+    #   - a closed QuantumSystem → the original Schrödinger ket rollout
+    #     (unchanged — every golden pin rides this path);
+    #   - an OpenQuantumSystem → the Lindblad master equation (DensityTrajectory,
+    #     Tsit5), so family decay (e.g. the bosonic record's κ/T1) is LIVE in
+    #     the response. The measurement function then receives the iso-packed
+    #     VECTORIZED density matrix (density_to_iso_vec = ket_to_iso∘vec) —
+    #     form-polymorphic measurement paths (see bosonic_ancilla_populations)
+    #     dispatch on the state's length.
     system = soc.system_builder(soc.twin.truth)
-    qtraj = KetTrajectory(system, recon, soc.ψ_init, soc.ψ_goal)
     knot_times = get_knot_times(recon)
-    blobs = [_respond(soc, soc.measurement_fn(ket_to_iso(qtraj(knot_times[k]))))
-             for k in prog.indices]
+    if system isa OpenQuantumSystem
+        ρ0 = soc.ψ_init * soc.ψ_init'
+        ρg = soc.ψ_goal * soc.ψ_goal'
+        qtraj = DensityTrajectory(system, recon, ρ0, ρg)
+        blobs = [_respond(soc, soc.measurement_fn(density_to_iso_vec(qtraj(knot_times[k]))))
+                 for k in prog.indices]
+    else
+        qtraj = KetTrajectory(system, recon, soc.ψ_init, soc.ψ_goal)
+        blobs = [_respond(soc, soc.measurement_fn(ket_to_iso(qtraj(knot_times[k]))))
+                 for k in prog.indices]
+    end
     # Drift (advance-after, documented in the docstring): the acquire measures
     # the truth as it stands, THEN ages it by dt — acquire k measures truth at
     # twin-time (k-1)·dt; the first acquire sees the record's pristine truth.
@@ -999,5 +1021,8 @@ end
 # base stubs).
 pulse_duration(pulse::AbstractPulse) = duration(pulse)
 sample_controls(pulse::AbstractPulse, times) = sample(pulse, times)
+
+# ──── The bosonic family (issue #21) ──────────────────────────────────────────
+include("bosonic_family.jl")
 
 end # module StrumentoPiccoloExt

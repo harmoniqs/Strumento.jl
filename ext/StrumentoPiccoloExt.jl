@@ -285,8 +285,21 @@ end
         # one complex-envelope gen channel, two measurement knots (DAC-grid samples
         # 11 and 101), dac_rate = 20 Hz. The rollout swap (issue #14: Piccolo-native
         # propagation replacing the SimulatedExperiment) must reproduce these blobs
-        # BIT-FOR-BIT — `==`, no tolerance. A last-ulp deviation here is a behavior
-        # change, not noise: report it, never silently widen.
+        # to golden precision — a real behavior change must fail loudly here.
+        #
+        # TRANSPORT TOLERANCE (cross-environment form, run 33344813818): the
+        # literals were captured on the-feynmachine (i9-12900KS, Julia 1.12.5) and
+        # are bit-exact there. CI run 33320865313 (PR #19) reproduced them
+        # BIT-EXACT on Julia 1.12.7; CI run 33344813818 (PR #23) — same Julia
+        # 1.12.7, same resolution (DataInterpolations 8.10.0, Piccolo 2.0.2, …) —
+        # drifted them 1–5 ulp: ubuntu-latest runner hardware rotation (the pool
+        # mixes Xeon/EPYC families; Julia's multi-microarch cloning + OpenBLAS
+        # kernel selection exercise different vectorized paths per CPU, and
+        # FMA-fusion differences move last ulps). The literal comparison therefore
+        # carries isapprox(rtol=1e-13, atol=1e-15): ~200× above the largest
+        # observed drift (5.1e-16 relative), ~4 orders of magnitude below any
+        # semantic forward-model change (≥1e-9). Within-process determinism pins
+        # elsewhere in this suite stay `==` — they are box- and version-immune.
         σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
         sys = QuantumSystem(1.0 * σz, [σx, σx], [1.0, 1.0])
         N = 11; T = 5.0
@@ -299,8 +312,10 @@ end
         soc = MockSoc(sys, ComplexF64[1, 0], ComplexF64[0, 1]; dac_rate=20.0)
         raw = execute!(soc, pulse, map, [11, 101])
 
-        @test raw == [ComplexF64[0.9987748357943047 + 0.0im, 0.0012251642056963555 + 0.0im],
-                      ComplexF64[0.9552991750369558 + 0.0im, 0.044700824963045074 + 0.0im]]
+        @test isapprox(raw,
+                       [ComplexF64[0.9987748357943047 + 0.0im, 0.0012251642056963555 + 0.0im],
+                        ComplexF64[0.9552991750369558 + 0.0im, 0.044700824963045074 + 0.0im]];
+                       rtol = 1e-13, atol = 1e-15)
     end
 end
 
@@ -757,11 +772,17 @@ end
         blob2 = execute!(soc, pulse, map, [11])[1]
 
         # acquire 1 measures the PRISTINE record truth — captured direct values
-        @test blob1 == [ComplexF64(0.9788483456466464 + 0.0im),
-                        ComplexF64(0.021151654353354598 + 0.0im)]
+        # (transport tolerance as elsewhere: the literals crossed runners 1–5
+        # ulp on CI run 33344813818 — hardware rotation, not semantics).
+        @test isapprox(blob1,
+                       [ComplexF64(0.9788483456466464 + 0.0im),
+                        ComplexF64(0.021151654353354598 + 0.0im)];
+                       rtol = 1e-13, atol = 1e-15)
         # acquire 2 measures truth aged one dt (ω = 1.0 + 0.1·1.0) — captured
-        @test blob2 == [ComplexF64(0.9788684314249929 + 0.0im),
-                        ComplexF64(0.021131568575006088 + 0.0im)]
+        @test isapprox(blob2,
+                       [ComplexF64(0.9788684314249929 + 0.0im),
+                        ComplexF64(0.021131568575006088 + 0.0im)];
+                       rtol = 1e-13, atol = 1e-15)
         # drift is real: consecutive acquires against the SAME pulse differ
         @test blob1 != blob2
         # the twin's clock advanced once per acquire
@@ -823,9 +844,20 @@ end
         # (a) GOLDEN PIN — captured from the DIRECT Piccolo rollout (same
         # system from the record's pristine truth, same played pulse, same
         # measurement function) + the record's confusion, BEFORE TwinSoc was
-        # implemented. `==`, no tolerance: a deviation is a behavior change.
-        @test raw == [ComplexF64[0.9788483456466464 + 0.0im, 0.021151654353354598 + 0.0im],
-                      ComplexF64[0.9379812245347385 + 0.0im, 0.06201877546526239 + 0.0im]]
+        # implemented, on the-feynmachine (i9-12900KS, Julia 1.12.5) — bit-exact
+        # there. TRANSPORT TOLERANCE (cross-environment form, run 33344813818):
+        # CI run 33320865313 (PR #19) reproduced captured literals like these
+        # bit-exact on Julia 1.12.7; CI run 33344813818 (PR #23) — same Julia,
+        # same resolution — drifted them 1–5 ulp (ubuntu-latest runner hardware
+        # rotation: multi-microarch vectorized paths differ per CPU). The
+        # literal carries isapprox(rtol=1e-13, atol=1e-15) — ~200× above the
+        # largest observed drift (5.1e-16 rel), ~4 orders below a semantic
+        # forward-model change (≥1e-9). The in-test mirror (b) below stays
+        # `==`: CI itself proved it box-immune on the failing run.
+        @test isapprox(raw,
+                       [ComplexF64[0.9788483456466464 + 0.0im, 0.021151654353354598 + 0.0im],
+                        ComplexF64[0.9379812245347385 + 0.0im, 0.06201877546526239 + 0.0im]];
+                       rtol = 1e-13, atol = 1e-15)
 
         # (b) the direct forward model computed HERE from public pieces — the
         # same translation, the same played-pulse reconstruction, the same
@@ -849,14 +881,18 @@ end
         @test raw == expected
 
         # (c) the degenerate-twin relationship, demonstrated (not re-derived):
-        # the direct rollout's RAW populations are bit-exact MockSoc's
-        # existing golden blobs — its pinned forward model on this very pulse
-        # and system shape. TwinSoc with an identity confusion and dt = 0
-        # would BE MockSoc; the confusion is the only difference.
+        # the direct rollout's RAW populations are MockSoc's own golden blobs
+        # (bit-exact captures — its pinned forward model on this very pulse and
+        # system shape). TwinSoc with an identity confusion and dt = 0 would
+        # BE MockSoc; the confusion is the only difference. Same transport
+        # tolerance as (a): the literals crossed runners 1–5 ulp on
+        # 33344813818 (hardware rotation), a semantic change is ≥1e-9.
         pops11 = populations(ket_to_iso(direct(kt[11])))
         pops101 = populations(ket_to_iso(direct(kt[101])))
-        @test pops11 == [0.9987748357943047, 0.0012251642056963555]
-        @test pops101 == [0.9552991750369558, 0.044700824963045074]
+        @test isapprox(pops11, [0.9987748357943047, 0.0012251642056963555];
+                       rtol = 1e-13, atol = 1e-15)
+        @test isapprox(pops101, [0.9552991750369558, 0.044700824963045074];
+                       rtol = 1e-13, atol = 1e-15)
     end
 end
 

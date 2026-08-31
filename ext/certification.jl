@@ -353,8 +353,23 @@ struct _CertModelCache
 end
 
 function _CertModelCache(model_sweep_at::Function, lo::Real, hi::Real, step::Real)
-    nodes = collect(lo:step:hi)
-    (first(nodes) ≤ lo && last(nodes) ≥ hi - step / 2) ||
+    lo_f, hi_f, step_f = Float64(lo), Float64(hi), Float64(step)
+    # The grid must cover [lo, hi] inclusively regardless of float fuzz in the
+    # edges. The K_c bracket is record_K_c ± K_c_halfbracket, and a record
+    # value like −15.87 makes the upper edge −15.87 + 8.0 = −7.869999999999999
+    # in Float64, so (hi − lo)/step lands at 7.999999999999999 and a
+    # `lo:step:hi` grid DROPS the last node — the real-record certification run
+    # failed exactly there (bracket [−23.87, −7.869999999999999], step 2.0,
+    # nodes stopped one short at −9.87; the synthetic CI fixtures carried an
+    # exact 16.0 bracket and never tripped the fuzz). Build the node count
+    # from ceil((hi − lo)/step) + 1 and pin both endpoints: coverage is exact,
+    # and the last interval may differ microscopically in spacing — fine for a
+    # precomputed model cache.
+    n_intervals = Int(ceil((hi_f - lo_f) / step_f))
+    nodes = collect(range(lo_f, hi_f; length = n_intervals + 1))
+    nodes[1] = lo_f
+    nodes[end] = hi_f
+    (first(nodes) ≤ lo && last(nodes) ≥ hi) ||
         error("cert fit: the bracket [$(lo), $(hi)] must be covered by the " *
               "grid step $step (nodes $(first(nodes))..$(last(nodes)))")
     sweeps = Dict{Float64,Vector{Float64}}(θ => model_sweep_at(θ) for θ in nodes)
@@ -932,6 +947,70 @@ end
         @test again.K_c_kHz == result.K_c_kHz
         @test again.chi_sigma_kHz == result.chi_sigma_kHz
         @test again.K_c_sigma_kHz == result.K_c_sigma_kHz
+    end
+end
+
+@testitem "cert 1 — the K_c model-cache grid covers the bracket under float fuzz (real-record regression)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using Strumento: load_record
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+
+        # The REAL-RECORD regression: the certification run against the real
+        # record failed at the K_c model cache — its record's K_c = −15.87 kHz
+        # makes the bracket's upper edge −15.87 + 8.0 = −7.869999999999999 in
+        # Float64, so the bracket length is 15.999999999999998 and the old `lo:step:hi`
+        # grid dropped the last node (nodes stopped at −9.87):
+        # "cert fit: the bracket [-23.87, -7.869999999999999] must be covered
+        # by the grid step 2.0". The synthetic CI fixtures (K_c = −12.3 → an
+        # exact 16.0 bracket) never tripped the fuzz; the real record did.
+        kc = -15.87                       # the fuzz-producing value
+        lo = kc - 8.0                     # the default design margin
+        hi = kc + 8.0
+        @test (hi - lo) != 16.0
+        @test length(collect(lo:2.0:hi)) == 8   # the old grid: one node short
+
+        # ── AC: the grid covers [lo, hi] inclusively under that fuzz ──
+        cache = ext._CertModelCache(θ -> fill(0.5, 3), lo, hi, 2.0)
+        @test cache.nodes[1] == lo
+        @test cache.nodes[end] == hi
+        @test issorted(cache.nodes) && all(diff(cache.nodes) .> 0)
+
+        # the EXACT bracket (the synthetic fixtures' case) is unchanged: 9
+        # nodes at step 2.0, endpoints pinned
+        exact = ext._CertModelCache(θ -> fill(0.5, 3), -20.3, -4.3, 2.0)
+        @test length(exact.nodes) == 9
+        @test exact.nodes[1] == -20.3 && exact.nodes[end] == -4.3
+
+        # ── AC: certify_parameter_recovery runs on a record carrying that
+        # K_c — the model-cache construction must not error (it did on the
+        # real record) and the fit must recover the record's K_c through the
+        # fuzz-covered grid. Reduced sweep/shot budget (the statistics item's
+        # variant) with the DEFAULT design margins: the grid construction
+        # depends only on the record value, the halfbracket, and the step.
+        design = ext.BosonicCertDesign(
+            comb_freqs_kHz = vcat(collect(230.0:24.0:350.0),
+                                  collect(520.0:24.0:640.0)),
+            ramsey_freqs_kHz = collect(245.0:9.0:353.0),
+            comb_shots = 100_000, ramsey_shots = 100_000)
+
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins",
+                           "bosonic-kc-fuzz.md")
+        record = load_record(fixture)
+        @test record.id == "synthetic-bosonic-kc-fuzz"
+        @test record.parameters["K_c_kHz"] == -15.87
+
+        # the real-record rehearsal shape: no perturbation (truth = record)
+        result = ext.certify_parameter_recovery(fixture; seed = 0xF00D,
+                                                design = design)
+        @test result.K_c_kHz !== nothing
+        @test lo ≤ result.K_c_kHz ≤ hi    # the fit stayed inside the fuzz bracket
+        @test abs(result.K_c_kHz - record.parameters["K_c_kHz"]) <
+              result.K_c_tolerance_kHz    # recovered through the fuzz-covered grid
     end
 end
 

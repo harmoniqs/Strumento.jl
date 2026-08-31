@@ -254,3 +254,101 @@ end
         @test D[4][idx(1, 1), idx(2, 1)] ≈ -0.5im           # cavity Q: i(a†−a)/2
     end
 end
+
+@testitem "bosonic family — the system is a function of CURRENT truth (drift felt; wiring errors named)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using Strumento: DriftPlan, Ramp, instantiate, load_record
+        using LinearAlgebra
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "bosonic.md")
+        twin = instantiate(fixture; drift = DriftPlan(), seed = 1)
+        builder = ext.bosonic_system_builder(twin.record)
+        idx(n, m) = (n - 1) * 2 + m
+
+        # ── truth-dependence: perturbing χ moves the dispersive signature at
+        # exactly the documented kHz → rad·GHz conversion ──
+        sys1 = builder(twin.truth)
+        truth2 = deepcopy(twin.truth)
+        truth2[:chi_kHz] += 1000.0                        # +1 MHz
+        sys2 = builder(truth2)
+        @test sys2.H_drift[idx(2, 2), idx(2, 2)] -
+              sys1.H_drift[idx(2, 2), idx(2, 2)] ≈ 2π * 1e-3 atol = 1e-18
+        # a Hamiltonian that is NOT a function of current truth (a cached
+        # system) would return the unperturbed value — the shift is exact
+
+        # ── advance!: the factory reflects DRIFTED truth (the seeded plan
+        # from the twin-core suite: Ramp(-0.5/day), 10 days → χ_kHz −5.0) ──
+        plan = DriftPlan(:chi_kHz => [Ramp(rate = -0.5)])
+        twin_d = instantiate(fixture; drift = plan, seed = 7)
+        sys_before = builder(twin_d.truth)
+        advance!(twin_d, 10.0)
+        @test twin_d.truth[:chi_kHz] == -303.4             # the twin moved
+        sys_after = builder(twin_d.truth)
+        @test sys_after.H_drift[idx(2, 2), idx(2, 2)] -
+              sys_before.H_drift[idx(2, 2), idx(2, 2)] ≈ 2π * (-5.0e-6) atol = 1e-18
+
+        # ── wiring errors are actionable ──
+        # a non-bosonic record: the factory is keyed by the record's family
+        spinrec = load_record(joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "spin.md"))
+        err = try
+            ext.bosonic_system_builder(spinrec); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        msg = sprint(showerror, err)
+        @test occursin("family", msg) && occursin("bosonic", msg)
+
+        # a record without the decay noise: the missing noise key is named
+        dir = mktempdir()
+        path = joinpath(dir, "no-decay.md")
+        write(path, "---\ntype: device-twin\nid: x\nfamily: bosonic\n" *
+                    "parameters:\n  chi_kHz: -298.4\n  K_q_GHz: -0.161\n" *
+                    "  K_c_kHz: -12.3\n  chi_p_kHz: 0.0\n" *
+                    "  N_transmon: 2\n  N_fock: 12\n" *
+                    "noise:\n  T1_q_us: {value: 120.0, estimate: true}\n" *
+                    "---\n# body\n")
+        rec = load_record(path)
+        err = try
+            ext.bosonic_system_builder(rec); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("kappa_c_per_us", sprint(showerror, err))
+
+        # a truth missing a required parameter: named actionably
+        err = try
+            builder(Dict{Symbol,Float64}(:chi_kHz => -298.4)); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin(":K_q_GHz", sprint(showerror, err))
+
+        # non-integer / too-small level counts: named actionably
+        bad = deepcopy(twin.truth)
+        bad[:N_fock] = 12.5
+        err = try
+            builder(bad); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("N_fock", sprint(showerror, err))
+        bad = deepcopy(twin.truth)
+        bad[:N_transmon] = 1.0
+        err = try
+            builder(bad); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("N_transmon", sprint(showerror, err))
+    end
+end

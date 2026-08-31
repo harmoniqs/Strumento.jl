@@ -477,3 +477,89 @@ end
         @test length(meas(ket_to_iso(ψ))) == n_t
     end
 end
+
+@testitem "bosonic family through TwinSoc — Lindblad rollout, T1 visible through the ancilla readout (seeded)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using Strumento: DriftPlan, instantiate
+        using LinearAlgebra
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        TwinSoc = ext.TwinSoc
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "bosonic.md")
+        twin = instantiate(fixture; drift = DriftPlan(), seed = 0xC0FFEE)
+        n_t = Int(twin.truth[:N_transmon])
+        n_f = Int(twin.truth[:N_fock])
+        idx(n, m) = (n - 1) * n_t + m
+
+        # the family rides the soc seam end-to-end: builder + measurement path
+        builder = ext.bosonic_system_builder(twin.record)
+        meas = ext.bosonic_ancilla_populations(n_t, n_f)
+
+        # |e,0⟩ decays freely (T1 e→g; the cavity starts in vacuum, so κ is not
+        # visible in the ancilla marginal — it is live in the dissipator, pinned
+        # in the factory test). Zero drives: the rolled pulse does nothing.
+        ψ_init = zeros(ComplexF64, n_t * n_f); ψ_init[idx(1, 2)] = 1.0   # |e,0⟩
+        ψ_goal = zeros(ComplexF64, n_t * n_f); ψ_goal[idx(1, 1)] = 1.0   # |g,0⟩
+        T = 5000.0                                                        # ns
+        N = 5
+        pulse = LinearSplinePulse(zeros(Float64, 4, N), collect(range(0.0, T, length = N)))
+        map = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1, q_drive = 2),
+                             QickGenChannel(1, 6e9; i_drive = 3, q_drive = 4)]; n_drives = 4)
+
+        soc = TwinSoc(twin, ψ_init, ψ_goal;
+                      families = Dict("bosonic" => builder),
+                      measurement_fn = meas, exact = true, dac_rate = 0.1)  # 501 samples
+        nsamp = floor(Int, T * 0.1) + 1
+        raw = execute!(soc, pulse, map, [nsamp])
+        blob = real.(raw[1])
+
+        # closed form: Pe = exp(−γ₁T), the record's T1 in ns units; the
+        # measured vector is the record's confusion remap of the marginal
+        γ = 1e-3 / twin.record.noise["T1_q_us"]["value"]
+        Pe = exp(-γ * T)
+        Crows = twin.record.noise["readout_confusion"]["value"]
+        C = Matrix{Float64}([Crows[i][j] for i in eachindex(Crows), j in eachindex(Crows)])
+        expected = C' * [1 - Pe, Pe]
+        @test blob ≈ expected rtol = 1e-4
+
+        # decay is LIVE at the semantic scale: a closed system would hold
+        # Pe = 1 (q_e = 0.94); 4% of the excited population decayed away
+        @test blob[2] < 0.91
+        @test blob[2] > 0.89                       # and decayed, not disappeared
+        # the confusion is applied (the blob is not the raw marginal)
+        @test blob ≠ [1 - Pe, Pe]
+        # a valid probability vector
+        @test sum(blob) ≈ 1.0 atol = 1e-9
+
+        # ── equivalence: the soc's response IS the direct forward model,
+        # computed here from public pieces (same translation, same Lindblad
+        # rollout, same marginal, same confusion) — `==`, within-process ──
+        prog = pulse_to_envelopes(pulse, map, 0.1, [nsamp])
+        ctrls = zeros(Float64, prog.n_drives, length(prog.times))
+        for (gen_ch, i_drive, q_drive) in prog.routing
+            idata, qdata = prog.envelopes[gen_ch]
+            ctrls[i_drive, :] .= idata
+            q_drive === nothing || (ctrls[q_drive, :] .= qdata)
+        end
+        recon = LinearSplinePulse(ctrls, prog.times)
+        ρ0 = ψ_init * ψ_init'
+        ρg = ψ_goal * ψ_goal'
+        qtraj = DensityTrajectory(builder(twin.truth), recon, ρ0, ρg)
+        t_end = prog.times[end]
+        p_direct = meas(density_to_iso_vec(qtraj(t_end)))
+        @test blob == ComplexF64.(C' * p_direct)
+        @test p_direct[2] ≈ Pe rtol = 1e-6       # the marginal decays at γ₁
+
+        # ── replay: the same seed through the soc reproduces bit-exact (the
+        # Lindblad path is deterministic — no stochastic draws with dt = 0) ──
+        twin2 = instantiate(fixture; drift = DriftPlan(), seed = 0xC0FFEE)
+        soc2 = TwinSoc(twin2, ψ_init, ψ_goal;
+                       families = Dict("bosonic" => builder),
+                       measurement_fn = meas, exact = true, dac_rate = 0.1)
+        @test real.(execute!(soc2, pulse, map, [nsamp])[1]) == blob
+    end
+end

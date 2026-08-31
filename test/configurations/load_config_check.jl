@@ -90,7 +90,7 @@ const BASE_SURFACE = [
 
 # Types DEFINED by the two package extensions — reachable through
 # `Base.get_extension` exactly when the trigger is loaded.
-const PICCOLO_EXT_TYPES = [:MockSoc]
+const PICCOLO_EXT_TYPES = [:MockSoc, :TwinSoc]
 const PYTHONCALL_EXT_TYPES = [:StrumentoSoc]
 
 """Build the scratch environment for `mode`: dev the repo, add the runner deps

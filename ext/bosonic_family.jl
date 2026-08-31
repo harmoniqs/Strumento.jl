@@ -563,3 +563,21 @@ end
         @test real.(execute!(soc2, pulse, map, [nsamp])[1]) == blob
     end
 end
+
+@testitem "the bosonic family rides the Piccolo extension; the base package gains nothing" begin
+    using Strumento
+    # This item is UNguarded (like the soc interface item): the base-placement
+    # pin must hold in EVERY load configuration — the family names must never
+    # exist on the base module, extension or not.
+    @test !isdefined(Strumento, :bosonic_system_builder)
+    @test !isdefined(Strumento, :bosonic_ancilla_populations)
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping the extension side: no Piccolo in this environment"
+        @test true
+    else
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        @test ext !== nothing
+        @test isdefined(ext, :bosonic_system_builder)
+        @test isdefined(ext, :bosonic_ancilla_populations)
+    end
+end

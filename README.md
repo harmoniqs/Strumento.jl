@@ -138,8 +138,12 @@ enhancement).
 Interface-complete with a tested pure-Julia mock suite. The real-board `StrumentoSoc`
 delegation path is validated with the QICK collaboration on hardware (it needs the Python
 `strumento` package + a board and is not exercised in CI). The twin core (drift, records,
-truth/belief contract) is absorbed from Sosia.jl (issue #15); family physics factories
-(the bosonic twin et al.), the soc face, and the wire server are later slices.
+truth/belief contract) is absorbed from Sosia.jl (issue #15); the twin's soc face
+(`TwinSoc`, issues #20/#23) and the bosonic family factory — the dispersive
+transmon-ancilla–cavity system with Lindblad decay, from the twin's current truth
+(issue #21) — ride the Piccolo extension, which also rolls `OpenQuantumSystem` family
+builders through the Lindblad master equation. Family physics factories for the other
+families (transmon, spin, atoms) and the wire server are later slices.
 Calibration routines and multi-board orchestration remain out of scope. The
 weakdeps/extensions split (issue #16) is done: Piccolo and PythonCall are package
 extensions — the base package (contract + twins) loads in an environment with neither,

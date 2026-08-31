@@ -31,13 +31,15 @@ import Strumento: AbstractSoc, execute!, load_envelope!, play_program!, acquire,
     dac_rate, adc_rate, QickChannelMap,
     pulse_to_envelopes,                 # the base verb: typed method added below
     QickProgram,                        # the base data contract: filled here
-    pulse_duration, sample_controls     # the pulse-sampling seam (typed methods below)
+    pulse_duration, sample_controls,    # the pulse-sampling seam (typed methods below)
+    DigitalTwin                         # the twin the soc face wraps (issue #20)
 using TestItems
 
 using Piccolo
 using Piccolo.Quantum.Pulses: duration, n_drives, sample, get_knot_times
 
 export MockSoc
+export TwinSoc
 
 # Default per-gen-channel envelope sample-memory cap (typical QICK firmware is
 # O(few k) samples per generator). Configurable per call.
@@ -298,6 +300,282 @@ end
 
         @test raw == [ComplexF64[0.9987748357943047 + 0.0im, 0.0012251642056963555 + 0.0im],
                       ComplexF64[0.9552991750369558 + 0.0im, 0.044700824963045074 + 0.0im]]
+    end
+end
+
+# ──── TwinSoc — the twin's soc face (issue #20) ──────────────────────────────
+# A simulated QICK SoC backed by a `DigitalTwin` — the face that makes the
+# twin contract (truth/belief/records/drift) reachable from the soc seam.
+# `MockSoc` is the degenerate twin (exact response, static truth, hand-passed
+# physics); `TwinSoc` generalizes exactly those three axes:
+#   - the system is BUILT from the twin's CURRENT truth via family dispatch
+#     (a builder keyed by the record's family field),
+#   - the response is imperfect by construction (the record's readout
+#     confusion matrix + binomial shot sampling, seeded from the twin's rng),
+#   - the truth drifts between acquires (advance-after, a configurable dt).
+#
+# ONE stochastic source: the twin's own `rng` (a StableRNG) drives BOTH the
+# drift draws and the shot sampling, in that order — identical seeds reproduce
+# identical measurement sequences bit-exactly, across fresh processes.
+
+"""
+    TwinSoc(twin, ψ_init, ψ_goal; families, measurement_fn=populations,
+            shots=100, exact=false, dt=0.0, dac_rate=1.0, adc_rate=1.0)
+
+A simulated QICK SoC backed by a `DigitalTwin` — `MockSoc`'s drifting,
+readout-confused generalization, pluggable wherever the mock plugs in
+(same verbs, same IQ blob packing, same downstream discrimination).
+
+The forward model per acquire:
+
+1. **Roll the CURRENT-truth system** — `families[twin.record.family]` builds a
+   `QuantumSystem` from `twin.truth` as it stands for THIS acquire (drifted
+   truth is therefore felt exactly when it has evolved). The played pulse is
+   reconstructed from the loaded envelopes exactly the way `MockSoc` does, and
+   propagated with Piccolo-native `KetTrajectory` propagation.
+2. **Response** — the measurement function (default `populations`) maps the
+   rolled-out state to a probability vector `p`; the record's readout
+   confusion matrix remaps it (`q = Cᵀ p` — rows of `C` are the TRUE state's
+   outcome distributions, `C[i, j] = P(measured j | true i)`); then either
+   * `exact = true`: `q` as-is (the deterministic mode — no sampling), or
+   * the default: **binomial shot sampling** — each of `shots` shots draws one
+     level from `q` (the blob is the per-level shot frequency), seeded from the
+     twin's rng.
+   The blob is packed exactly the way `MockSoc` packs blobs
+   (`Vector{ComplexF64}`, real data) so `iq_to_measurements` and downstream
+   discrimination are unchanged.
+3. **Drift (advance-after)** — AFTER the response, the twin's truth is advanced
+   by `dt` (twin-time, days by convention) when `dt > 0`: acquire *k* measures
+   truth at twin-time `(k-1)·dt` — the FIRST acquire sees the record's pristine
+   truth (t = 0, where belief and truth agree), and each subsequent acquire
+   sees truth aged one `dt` further. `dt = 0` (the default) skips the advance
+   entirely: static truth, no drift draws consumed, no scheduled jumps fired —
+   MockSoc-like usage stays deterministic.
+
+The record's readout confusion is required (the v1 response model): the soc
+unwraps it from the vault's `noise.readout_confusion = {value, estimate, note}`
+wrapper and validates it is square, non-negative, and row-stochastic. All
+stochasticity flows from `twin.rng` — construct twins with
+`instantiate(...; seed = s)` and identical seeds replay identically.
+"""
+mutable struct TwinSoc <: AbstractSoc
+    twin::DigitalTwin
+    family::String              # the record's family (the dispatch key used)
+    system_builder::Function    # (truth::Dict{Symbol,Float64}) -> QuantumSystem
+    confusion::Matrix{Float64}   # the record's readout confusion (rows = true states)
+    ψ_init::Vector{ComplexF64}
+    ψ_goal::Vector{ComplexF64}
+    measurement_fn::Function
+    shots::Int
+    exact::Bool
+    dt::Float64
+    dac_rate::Float64
+    adc_rate::Float64
+    _env::Dict{Int,Tuple{Vector{Float64},Vector{Float64}}}
+    _program::Union{Nothing,QickProgram}
+end
+
+function TwinSoc(twin::DigitalTwin, ψ_init::AbstractVector, ψ_goal::AbstractVector;
+                 families::AbstractDict{<:AbstractString},
+                 measurement_fn::Function = populations,
+                 shots::Integer = 100,
+                 exact::Bool = false,
+                 dt::Real = 0.0,
+                 dac_rate::Real = 1.0, adc_rate::Real = 1.0)
+    family = twin.record.family
+    haskey(families, family) || error(
+        "TwinSoc: no system builder for family $(repr(family)) (record " *
+        "$(repr(twin.record.id))) — known families: $(sort(collect(keys(families))))")
+    shots ≥ 1 || error("TwinSoc: shots must be ≥ 1 (got $shots)")
+    dt ≥ 0 || error("TwinSoc: dt must be ≥ 0 — twin-time only runs forward (got $dt)")
+    return TwinSoc(twin, family, families[family], _record_confusion(twin),
+                   ComplexF64.(ψ_init), ComplexF64.(ψ_goal), measurement_fn,
+                   Int(shots), exact, Float64(dt),
+                   Float64(dac_rate), Float64(adc_rate),
+                   Dict{Int,Tuple{Vector{Float64},Vector{Float64}}}(), nothing)
+end
+
+# Unwrap + validate the record's readout confusion. The vault schema wraps
+# noise values as {value, estimate, note}; the matrix lives under `value`.
+# Convention: rows are the TRUE state's outcome distributions — C[i, j] =
+# P(measured j | true i) — so each row is a probability vector and the remap
+# is q = Cᵀ p (p = the true population vector, q = the expectation of the
+# measured one).
+function _record_confusion(twin::DigitalTwin)
+    wrapped = get(twin.record.noise, "readout_confusion", nothing)
+    wrapped === nothing && error(
+        "TwinSoc: record $(repr(twin.record.id)) carries no " *
+        "noise.readout_confusion — the v1 response model requires the readout " *
+        "confusion matrix in the wrapped form {value: [[...]], estimate, note}")
+    wrapped isa AbstractDict || error(
+        "TwinSoc: noise.readout_confusion must be the wrapped form " *
+        "{value: [[...]], estimate, note} (got $(typeof(wrapped)))")
+    haskey(wrapped, "value") || error(
+        "TwinSoc: noise.readout_confusion is missing its `value` key — the " *
+        "wrapped form is {value: [[...]], estimate, note}")
+    rows = wrapped["value"]
+    (rows isa AbstractVector && !isempty(rows)) || error(
+        "TwinSoc: noise.readout_confusion.value must be a non-empty list of " *
+        "rows (got $(typeof(rows)))")
+    n = length(rows)
+    all(r -> r isa AbstractVector && length(r) == n, rows) || error(
+        "TwinSoc: noise.readout_confusion.value must be square ($(n) rows, " *
+        "lengths $(map(length, rows)))")
+    C = Matrix{Float64}(undef, n, n)
+    for i in 1:n, j in 1:n
+        C[i, j] = Float64(rows[i][j])
+    end
+    all(≥(0), C) || error(
+        "TwinSoc: readout_confusion entries must be ≥ 0 (the matrix maps " *
+        "probabilities to probabilities)")
+    for i in 1:n
+        isapprox(sum(C[i, :]), 1.0; atol = 1e-9) || error(
+            "TwinSoc: readout_confusion row $i sums to $(sum(C[i, :])) ≠ 1 — " *
+            "rows are the TRUE state's outcome distributions (C[i, j] = " *
+            "P(measured j | true i)), so each row must be a probability vector")
+    end
+    return C
+end
+
+# The response seam (v1): measurement vector → confusion remap → (binomial
+# shot sampling | exact) → IQ blob, packed exactly the way MockSoc packs
+# blobs so downstream discrimination is unchanged.
+function _respond(soc::TwinSoc, p::AbstractVector{<:Real})
+    C = soc.confusion
+    (length(p) == size(C, 1) == size(C, 2)) || error(
+        "TwinSoc: measurement vector length $(length(p)) ≠ the record's " *
+        "$(size(C, 1))×$(size(C, 2)) readout_confusion — the confusion must " *
+        "match the measurement dimension (family $(repr(soc.family)))")
+    isapprox(sum(p), 1.0; atol = 1e-6) || error(
+        "TwinSoc: the measurement vector must be a probability vector " *
+        "(sum(p) = $(sum(p)); family $(repr(soc.family))) — the v1 confusion " *
+        "model remaps populations")
+    q = [sum(C[i, j] * p[i] for i in eachindex(p)) for j in eachindex(p)]
+    soc.exact && return ComplexF64.(q)
+    # Binomial shot sampling: each shot draws one level from q; the blob is
+    # the per-level shot frequency (count / shots). One rng draw per shot,
+    # taken from the twin's rng — the drift draws and the shot draws share
+    # the single seeded source.
+    counts = zeros(Int, length(q))
+    for _ in 1:soc.shots
+        u = rand(soc.twin.rng)
+        j = length(q)               # float-accumulation edge: the last level
+        acc = 0.0
+        for k in eachindex(q)
+            acc += q[k]
+            u < acc && (j = k; break)
+        end
+        counts[j] += 1
+    end
+    return ComplexF64.(counts ./ soc.shots)
+end
+
+dac_rate(soc::TwinSoc) = soc.dac_rate
+adc_rate(soc::TwinSoc) = soc.adc_rate
+
+load_envelope!(soc::TwinSoc, gen_ch::Int, idata, qdata) =
+    (soc._env[gen_ch] = (Vector{Float64}(idata), Vector{Float64}(qdata)); nothing)
+
+play_program!(soc::TwinSoc, program::QickProgram) = (soc._program = program; nothing)
+
+# execute! — the AbstractSoc verb: translate the pulse in Julia (the same
+# QICK-shaped envelope path the mock runs), load + play, then acquire.
+function execute!(soc::TwinSoc, pulse::AbstractPulse, channel_map::QickChannelMap,
+                  indices::Vector{Int})
+    prog = pulse_to_envelopes(pulse, channel_map, dac_rate(soc), indices)
+    for (gen_ch, (idata, qdata)) in prog.envelopes
+        load_envelope!(soc, gen_ch, idata, qdata)
+    end
+    play_program!(soc, prog)
+    return acquire(soc, channel_map.readout_chs)
+end
+
+function acquire(soc::TwinSoc, _ro_chs)
+    prog = soc._program
+    prog === nothing && error("TwinSoc.acquire: no program played")
+    # Reconstruct the drive controls from the loaded per-channel envelopes —
+    # the same inversion MockSoc performs, so the played pulse is identical.
+    nsamp = length(prog.times)
+    ctrls = zeros(Float64, prog.n_drives, nsamp)
+    for (gen_ch, i_drive, q_drive) in prog.routing
+        idata, qdata = soc._env[gen_ch]
+        ctrls[i_drive, :] .= idata
+        q_drive === nothing || (ctrls[q_drive, :] .= qdata)
+    end
+    recon = LinearSplinePulse(ctrls, prog.times)
+    # Roll the CURRENT-truth system: the family builder consumes the twin's
+    # truth as it stands for THIS acquire.
+    system = soc.system_builder(soc.twin.truth)
+    qtraj = KetTrajectory(system, recon, soc.ψ_init, soc.ψ_goal)
+    knot_times = get_knot_times(recon)
+    return [_respond(soc, soc.measurement_fn(ket_to_iso(qtraj(knot_times[k]))))
+            for k in prog.indices]
+end
+
+@testitem "TwinSoc executes the soc verbs over the twin's current truth (family seam)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using LinearAlgebra
+        # The twin soc is extension-defined: reach it through its canonical handle.
+        TwinSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).TwinSoc
+        @test TwinSoc <: Strumento.AbstractSoc   # pluggable wherever the mock plugs in
+
+        # The toy family (test-side): a QuantumSystem built from the twin's
+        # CURRENT truth — two σx drives for the two envelope quadratures.
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) = QuantumSystem(truth[:omega] * σz, [σx, σx],
+                                          [truth[:drive_bound], truth[:drive_bound]])
+
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+        twin = instantiate(fixture; drift = DriftPlan(), seed = 0xC0FFEE)
+
+        # families is keyed by the RECORD's family field — dispatch, not registry
+        soc = TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                      families = Dict("toy" => toy_family),
+                      exact = true, dac_rate = 20.0)
+
+        # the fixed golden pulse — the MockSoc golden fixture's deterministic shape
+        N = 11; T = 5.0
+        times = collect(range(0.0, T, length = N))
+        vals = 0.1 .* permutedims(hcat(sin.(range(0.0, 2.4π, length = N)),
+                                       cos.(range(0.3π, 1.7π, length = N))))
+        pulse = LinearSplinePulse(vals, times)
+        map = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1, q_drive = 2)]; n_drives = 2)
+
+        raw = execute!(soc, pulse, map, [11, 101])
+
+        # IQ blobs packed exactly the way MockSoc packs them (real data, zero imag)
+        @test length(raw) == 2
+        @test raw[1] isa Vector{ComplexF64}
+        @test all(iszero.(imag.(raw[1])))
+        pops = real.(raw[2])
+        @test length(pops) == 2
+        @test all(pops .≥ 0) && all(pops .≤ 1)
+        @test sum(pops) ≈ 1.0 atol = 1e-9    # confusion maps probabilities to probabilities
+
+        # pluggable wherever the mock plugs in: downstream readout is unchanged
+        ms = iq_to_measurements(raw, b -> real.(b), [11, 101])
+        @test ms[1].data == real.(raw[1])
+        @test ms[2].index == 101
+
+        # the response is imperfect BY CONSTRUCTION: the exact (confusion-remap)
+        # blob at the final knot is NOT the raw rollout population vector
+        # (captured direct values: raw 0.9552991750369558 → confused 0.9379812245347385)
+        @test real.(raw[2]) ≈ [0.9379812245347385, 0.06201877546526239] atol = 1e-12
+        @test real.(raw[2]) != [0.9552991750369558, 0.044700824963045074]
+
+        # the default response is sampled (binomial shots): a valid probability
+        # vector that deviates from the exact remap
+        soc_s = TwinSoc(instantiate(fixture; drift = DriftPlan(), seed = 0xC0FFEE),
+                        ComplexF64[1, 0], ComplexF64[0, 1];
+                        families = Dict("toy" => toy_family), dac_rate = 20.0)
+        raw_s = execute!(soc_s, pulse, map, [101])
+        @test sum(real.(raw_s[1])) ≈ 1.0 atol = 1e-9
+        @test real.(raw_s[1]) != real.(raw[2])
     end
 end
 

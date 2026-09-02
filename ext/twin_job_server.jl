@@ -207,8 +207,7 @@ function _sweep_ladder(program::AbstractDict, n_waves::Int, expts::Union{Nothing
                           get(i, "DST", "") == "r_wave" && get(i, "SRC", "") == "wmem",
                      insts) ||
                  any(i -> get(i, "CMD", "") == "WMEM_WR", insts)
-    isempty_any = !has_ladder
-    isempty_any && return Tuple{Int,String,Int}[]
+    has_ladder || return Tuple{Int,String,Int}[]
     # the expts loop's back-edge anchors the ladder split: the TEST whose
     # literal counter is the DECLARED expts count − 1, followed by a
     # conditional JUMP (the loop's increment-carrying back-edge)

@@ -119,6 +119,10 @@ function _decode_np_array(triple, what::String)
     return Vector{Int16}(samples[1:2:(2n-1)]), Vector{Int16}(samples[2:2:2n])
 end
 
+# The channel keys of a dump_prog channel map (a JSON object keyed by the
+# channel's string form: "0", "1", ...).
+keys_str(obj) = String[string(k) for k in keys(obj)]   # then parse(Int, _) for channels
+
 # Unpack qick's generator conf register (cfg2reg's layout: outsel bits 0-1,
 # mode bit 2, stdysel bit 3, phrst bit 4, tmux at bit 8+).
 function _decode_conf(conf::Int, name::String)
@@ -291,6 +295,38 @@ function read_payload(soccfg::AbstractDict, job_wire::AbstractDict)
             "contract: reps/soft_avgs/ro_chs/reads_per_shot[/expts])",
         )
     end
+    reps, soft_avgs = Int(acquire["reps"]), Int(acquire["soft_avgs"])
+    reps ≥ 1 || error("read_payload: acquire reps must be ≥ 1 (got $reps)")
+    soft_avgs ≥ 1 || error("read_payload: acquire soft_avgs must be ≥ 1 (got $soft_avgs)")
+    ro_chs = Int.(acquire["ro_chs"])
+    reads_per_shot = Int.(acquire["reads_per_shot"])
+    # the declared readout surface must match the program's own declarations —
+    # the same refuse-on-mismatch rule the reference board-side agent applies
+    # (ro_chs and reads_per_shot come from the program's trigger counting, so
+    # a disagreement means the buffers would be silently mis-shaped).
+    declared_ros = sort!(parse.(Int, keys_str(program["ro_chs"])))
+    sort!(ro_chs) == declared_ros || error(
+        "read_payload: the acquire block declares readout channels $(sort!(copy(ro_chs))) " *
+        "but the program declared $declared_ros — refusing a job whose declared " *
+        "shape does not match its program",
+    )
+    length(reads_per_shot) == length(ro_chs) || error(
+        "read_payload: reads_per_shot has $(length(reads_per_shot)) entries but " *
+        "acquire declares $(length(ro_chs)) readout channels",
+    )
+    for (i, ch) in enumerate(ro_chs)
+        trigs = get(program["ro_chs"][string(ch)], "trigs", nothing)
+        trigs isa Integer || error(
+            "read_payload: the program's ro_chs[$ch] carries no `trigs` — " *
+            "the per-channel trigger count is dump_prog's declaration",
+        )
+        reads_per_shot[i] == Int(trigs) || error(
+            "read_payload: the acquire block declares reads_per_shot[$i] = " *
+            "$(reads_per_shot[i]) but the program's readout channel $ch triggers " *
+            "$trigs reads per shot — refusing a job whose declared shape does " *
+            "not match its program",
+        )
+    end
     expt_dims = loop_dims[setdiff(1:length(loop_dims), avg_level + 1)]
     derived_expts = isempty(expt_dims) ? nothing : prod(expt_dims)
     declared = get(acquire, "expts", nothing)
@@ -314,10 +350,10 @@ function read_payload(soccfg::AbstractDict, job_wire::AbstractDict)
         Dict{String,String}(
             string(k) => string(v) for (k, v) in get(program, "labels", Dict())
         ),
-        Int(acquire["reps"]),
-        Int(acquire["soft_avgs"]),
-        Int.(acquire["ro_chs"]),
-        Int.(acquire["reads_per_shot"]),
+        reps,
+        soft_avgs,
+        ro_chs,
+        reads_per_shot,
         derived_expts,
     )
 end
@@ -394,5 +430,150 @@ end
         @test payload.ro_chs == [0]
         @test payload.reads_per_shot == [1]
         @test payload.expts == 11                      # prod of loop_dims minus the averaged axis
+    end
+end
+
+@testitem "read_payload names the defect on malformed payloads" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures", "_fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "soccfg_v2_testbench.json"))
+        golden = JSON.parsefile(joinpath(fixtures, "compiled_job_golden.json"))
+
+        # every case: the mutation, and the needle the error must carry (the
+        # error names WHAT is wrong and WHERE — a malformed payload is a
+        # wire-contract violation, not a 500).
+        mutate(fn) = (w = deepcopy(golden); fn(w); w)
+        cases = [
+            (mutate(w -> delete!(w, "program")), "missing `program`"),
+            (mutate(w -> delete!(w["program"], "waves")), "missing `waves`"),
+            (mutate(w -> delete!(w["program"], "avg_level")), "missing `avg_level`"),
+            # a truncated envelope: the declared shape outruns the bytes
+            (
+                mutate(
+                    w -> (
+                        e = w["program"]["envelopes"][1]["envs"]["env0_0"];
+                        e["data"] = [e["data"][1], [10, 2], e["data"][3]];
+                        w
+                    ),
+                ),
+                "declares 10 I/Q int16 pairs",
+            ),
+            # a shape that is not an I/Q pair
+            (
+                mutate(
+                    w -> (
+                        e = w["program"]["envelopes"][1]["envs"]["env0_0"];
+                        e["data"] = [e["data"][1], [1152, 1], e["data"][3]];
+                        w
+                    ),
+                ),
+                "(n, 2)",
+            ),
+            # an unsupported dtype (qick emits int16 pages)
+            (
+                mutate(
+                    w -> (
+                        e = w["program"]["envelopes"][1]["envs"]["env0_0"];
+                        e["data"] = [e["data"][1], e["data"][2], "<i4"];
+                        w
+                    ),
+                ),
+                "\"<i4\"",
+            ),
+            # a wave entry missing its gain
+            (
+                mutate(
+                    w -> (
+                        d = Dict(w["program"]["waves"][1]);
+                        delete!(d, "gain");
+                        w["program"]["waves"][1] = d;
+                        w
+                    ),
+                ),
+                "`gain`",
+            ),
+            # tmux bits in conf — muxed generators are outside v1's envelope level
+            (
+                mutate(
+                    w -> (
+                        d = Dict(w["program"]["waves"][1]);
+                        d["conf"] = 256 + d["conf"];
+                        w["program"]["waves"][1] = d;
+                        w
+                    ),
+                ),
+                "tmux",
+            ),
+            # a port write pointing past the wave table
+            (
+                mutate(
+                    w -> (
+                        inst = Dict(w["program"]["prog_list"][6]);
+                        inst["ADDR"] = "&9";
+                        w["program"]["prog_list"][6] = inst;
+                        w
+                    ),
+                ),
+                "wave 10",
+            ),
+            # the acquire block lying about the sweep axis
+            (
+                mutate(
+                    w -> (w["acquire"] = merge(Dict(w["acquire"]), Dict("expts" => 10)); w),
+                ),
+                "expts=10",
+            ),
+            # an acquire readout the program never declared
+            (
+                mutate(
+                    w -> (
+                        w["acquire"] = merge(Dict(w["acquire"]), Dict("ro_chs" => [7]));
+                        w
+                    ),
+                ),
+                "readout channels [7]",
+            ),
+            # reads_per_shot disagreeing with the program's trigger count
+            (
+                mutate(
+                    w -> (
+                        w["acquire"] = merge(
+                            Dict(w["acquire"]),
+                            Dict("reads_per_shot" => [2]),
+                        );
+                        w
+                    ),
+                ),
+                "reads_per_shot",
+            ),
+            # avg_level outside the loop structure
+            (
+                mutate(
+                    w -> (
+                        w["program"] = merge(Dict(w["program"]), Dict("avg_level" => 3));
+                        w
+                    ),
+                ),
+                "avg_level 3",
+            ),
+        ]
+        for (wire, needle) in cases
+            err = try
+                ext.read_payload(soccfg, wire);
+                nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin(needle, sprint(showerror, err))
+        end
     end
 end

@@ -72,6 +72,7 @@ using TestItems
 
 using JSON
 using Piccolo
+using Sockets        # the HTTP layer: stdlib, no new dependency edge
 
 export TwinJobServer
 

@@ -674,6 +674,9 @@ mutable struct TwinJobServer
     overlay_id::String
     overlays::Tuple{Vararg{String}}
     dt::Float64
+    jobs::Dict{String,Dict{String,Any}}   # job id => its record (status + payload)
+    queue::Vector{String}                 # pending ids, FIFO — one worker owns the board
+    n::Int                                # the next job id
 end
 
 function TwinJobServer(soc, soccfg::AbstractDict;
@@ -686,7 +689,8 @@ function TwinJobServer(soc, soccfg::AbstractDict;
         "server fronts the twin face (family + confusion + seeded response)")
     dt ≥ 0 || error(
         "TwinJobServer: dt must be ≥ 0 — twin-time only runs forward (got $dt)")
-    return TwinJobServer(soc, soccfg, String(overlay_id), overlays, Float64(dt))
+    return TwinJobServer(soc, soccfg, String(overlay_id), overlays, Float64(dt),
+                         Dict{String,Dict{String,Any}}(), String[], 0)
 end
 
 # The overlay personality (D25: one overlay ⇔ one snapshot). "" means whatever
@@ -819,6 +823,181 @@ function execute_job(server::TwinJobServer, job_wire::AbstractDict)
         [[[vals[r, e, 1], vals[r, e, 2]] for e in 1:expts] for r in 1:n_reads]
     end
     return Dict{String,Any}("iq" => Any[iq])
+end
+
+# ──── The job queue — the reference agent's shape (examples/jobserver) ───────
+# submit enqueues; a poll is the single worker's turn (one board, one worker —
+# hardware exclusivity is structural); the status dicts are exactly what the
+# Python JobServerClient promises: {"status": "pending"} while queued,
+# {"status": "done", "acquisition": {...}} on success, {"status": "error",
+# "error": "..."} on failure. A failed job never takes the server down.
+
+"TwinJobServer error strings mirror the reference agent's `{type}: {message}`."
+_error_string(err) = err isa ErrorException ? string("ErrorException: ", err.msg) :
+                     sprint(showerror, err)
+
+"""    submit!(server, job_wire) -> String
+
+Enqueue one `CompiledJob` wire dict; returns its job id (incrementing strings,
+the reference agent's ids)."""
+function submit!(server::TwinJobServer, job_wire::AbstractDict)
+    id = string(server.n)
+    server.n += 1
+    server.jobs[id] = Dict{String,Any}("status" => "pending", "job" => job_wire)
+    push!(server.queue, id)
+    return id
+end
+
+"""    poll(server, job_id) -> Dict
+
+The status dict for one job: pending (running the worker's turn first — a poll
+is when the single worker gets its turn, the reference agent's discipline),
+done with its `acquisition`, or error with the message. An unknown id is an
+error dict, not an exception."""
+function poll(server::TwinJobServer, job_id::AbstractString)
+    haskey(server.jobs, job_id) || return Dict{String,Any}(
+        "status" => "error", "error" => "unknown job \"$(job_id)\"")
+    record = server.jobs[job_id]
+    record["status"] == "pending" && work!(server)
+    return Dict{String,Any}(k => v for (k, v) in record if k != "job")
+end
+
+"""    work!(server) -> Union{String,Nothing}
+
+Run the job at the head of the queue (FIFO). Returns its id, or `nothing` when
+idle. A failed job records `{"status": "error", "error": ...}` and the server
+keeps serving."""
+function work!(server::TwinJobServer)
+    isempty(server.queue) && return nothing
+    job_id = popfirst!(server.queue)
+    record = server.jobs[job_id]
+    try
+        acquisition = execute_job(server, record["job"])
+        record["status"] = "done"
+        record["acquisition"] = acquisition
+    catch err
+        record["status"] = "error"
+        record["error"] = _error_string(err)
+    end
+    return job_id
+end
+
+# ──── The HTTP layer — stdlib Sockets, the two wire routes ───────────────────
+# POST /jobs  body = the CompiledJob wire JSON  -> {"job_id": "..."}
+# GET  /jobs/<id>  -> the status dict (404 on unknown ids)
+# One request per connection, HTTP/1.1, JSON bodies; a malformed connection or
+# a failed job never takes the accept loop down.
+
+"""The handle `serve_http` returns: the listener, its accept task, and the
+server it fronts. `stop_http` closes the listener and joins the task."""
+mutable struct TwinJobHttp
+    server::TwinJobServer
+    listener::Sockets.TCPServer
+    task::Task
+    host::IPAddr
+    port::UInt16
+end
+
+"""    serve_http(server; host = ip"127.0.0.1", port = 0) -> TwinJobHttp
+
+Serve the twin job server over HTTP — the wire protocol the Python
+`JobServerClient`'s deployment speaks (two routes, one request per
+connection). `port = 0` (the default) binds an ephemeral port; read the real
+address with `http_address`. The accept loop runs in an `@async` task; each
+connection is handled independently (a bad request costs its own connection,
+never the server)."""
+function serve_http(server::TwinJobServer; host::IPAddr = ip"127.0.0.1",
+                    port::Integer = 0)
+    tcp = listen(host, port)
+    _, bound_port = getsockname(tcp)
+    task = @async begin
+        try
+            while isopen(tcp)
+                sock = accept(tcp)
+                @async begin
+                    try
+                        _handle_connection(server, sock)
+                    catch err           # a broken connection is that connection's problem
+                        try
+                            close(sock)
+                        catch
+                        end
+                    end
+                end
+            end
+        catch err                     # the listener closed (stop_http) or died
+            isopen(tcp) && rethrow(err)
+        end
+    end
+    return TwinJobHttp(server, tcp, task, host, UInt16(bound_port))
+end
+
+"`serve_http`'s bound address (the host it was asked for, the port actually bound)."
+http_address(http::TwinJobHttp) = (http.host, Int(http.port))
+
+"""    stop_http(http)
+
+Close the listener and join the accept task. Queued jobs stay pending — a
+stopped server is a stopped board; draining the queue is the operator's act."""
+function stop_http(http::TwinJobHttp)
+    close(http.listener)
+    istaskdone(http.task) || wait(http.task)
+    return nothing
+end
+
+function _handle_connection(server::TwinJobServer, sock)
+    request = readline(sock)                       # "METHOD /path HTTP/1.1"
+    parts = split(request; limit = 3)
+    length(parts) == 3 && return _route_request(server, sock, String(parts[1]),
+                                                String(parts[2]))
+    return _respond_close!(sock, 400, Dict(
+        "error" => "malformed request line $(repr(request))"))
+end
+
+function _route_request(server::TwinJobServer, sock, method::String, path::String)
+    content_length = 0
+    while (line = readline(sock)) != ""            # headers, then the blank line
+        m = match(r"^Content-Length:\s*(\d+)\s*$"i, line)
+        m === nothing || (content_length = parse(Int, m[1]))
+    end
+    body = content_length > 0 ? String(read(sock, content_length)) : ""
+    if method == "POST" && path == "/jobs"
+        job = try
+            JSON.parse(body)
+        catch err
+            return _respond_close!(sock, 400, Dict(
+                "error" => "the request body is not valid JSON ($(sprint(showerror, err)))"))
+        end
+        job isa AbstractDict || return _respond_close!(sock, 400, Dict(
+            "error" => "the request body must be a JSON object (the CompiledJob wire form)"))
+        return _respond_close!(sock, 200, Dict("job_id" => submit!(server, job)))
+    elseif method == "GET" && (m = match(r"^/jobs/([^/]+)$", path)) !== nothing
+        job_id = String(only(m.captures))
+        # a failed job is still a KNOWN job (200, the error rides the status
+        # dict); an unknown id is 404 — the deployment mapping the module
+        # docstring promises
+        return _respond_close!(sock, haskey(server.jobs, job_id) ? 200 : 404,
+                               poll(server, job_id))
+    end
+    return _respond_close!(sock, 404, Dict(
+        "error" => "no route $(repr(method)) $(repr(path)) — the wire protocol is " *
+                   "POST /jobs and GET /jobs/<id>"))
+end
+
+function _respond_close!(sock, status::Int, body::AbstractDict)
+    _respond!(sock, status, body)
+    close(sock)                       # Connection: close — one request per connection
+    return nothing
+end
+
+function _respond!(sock, status::Int, body::AbstractDict)
+    payload = JSON.json(body)
+    reason = status == 200 ? "OK" : status == 400 ? "Bad Request" : "Not Found"
+    write(sock, "HTTP/1.1 $status $reason\r\n" *
+                "Content-Type: application/json\r\n" *
+                "Content-Length: $(sizeof(payload))\r\n" *
+                "Connection: close\r\n\r\n" * payload)
+    return nothing
 end
 
 @testitem "the twin job server rides its own Piccolo+JSON extension" begin
@@ -1316,5 +1495,115 @@ end
         @test exc[1] ≈ 0.02 atol = 1e-12
         # JSON-safe all the way down (the wire contract)
         @test JSON.parse(JSON.json(out)) == out
+    end
+end
+
+@testitem "the HTTP contract: submit → poll → RawAcquisition, the JobServerClient way" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        using Sockets
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        TwinSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).TwinSoc
+        using Strumento: DriftPlan, instantiate
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures", "_fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "soccfg_v2_testbench.json"))
+        golden = JSON.parsefile(joinpath(fixtures, "compiled_job_golden.json"))
+        nosweep = JSON.parsefile(joinpath(fixtures, "compiled_job_nosweep.json"))
+        toy = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) =
+            QuantumSystem(truth[:omega] * σz, [σx, σx], [truth[:drive_bound], truth[:drive_bound]])
+        soc = TwinSoc(instantiate(toy; drift = DriftPlan(), seed = 0xC0FFEE),
+                      ComplexF64[1, 0], ComplexF64[0, 1];
+                      families = Dict("toy" => toy_family), exact = true,
+                      dac_rate = 9584.64)
+        server = ext.TwinJobServer(soc, soccfg; overlay_id = "testbench-v2")
+
+        # a minimal JobServerClient over raw sockets: submit → poll, the same
+        # two calls the Python JobServerSoc makes (HTTP details live here)
+        submit(client_host, client_port, body::AbstractDict) = begin
+            sock = connect(client_host, client_port)
+            payload = JSON.json(body)
+            write(sock, "POST /jobs HTTP/1.1\r\n" *
+                        "Host: twin\r\nContent-Type: application/json\r\n" *
+                        "Content-Length: $(sizeof(payload))\r\nConnection: close\r\n\r\n" *
+                        payload)
+            resp = read(sock, String)
+            close(sock)
+            head, rest = split(resp, "\r\n\r\n"; limit = 2)
+            status = parse(Int, split(first(split(head, "\r\n")))[2])
+            return status, JSON.parse(String(rest))
+        end
+        poll(client_host, client_port, job_id::AbstractString) = begin
+            sock = connect(client_host, client_port)
+            write(sock, "GET /jobs/$job_id HTTP/1.1\r\n" *
+                        "Host: twin\r\nConnection: close\r\n\r\n")
+            resp = read(sock, String)
+            close(sock)
+            head, rest = split(resp, "\r\n\r\n"; limit = 2)
+            status = parse(Int, split(first(split(head, "\r\n")))[2])
+            return status, JSON.parse(String(rest))
+        end
+
+        http = ext.serve_http(server)                     # an ephemeral port
+        host, port = ext.http_address(http)
+
+        # ── submit → poll: the golden comes back done, shaped, JSON-safe
+        status, reply = submit(host, port, golden)
+        @test status == 200
+        @test haskey(reply, "job_id")
+        job_id = reply["job_id"]
+        pstatus, preply = poll(host, port, job_id)
+        @test pstatus == 200
+        @test preply["status"] == "done"
+        iq = preply["acquisition"]["iq"]
+        @test length(iq) == 1 && length(iq[1]) == 1 && length(iq[1][1]) == 11   # (n_reads, expts, I/Q)
+        @test iq[1][1][1][1] ≈ 0.98 atol = 1e-12          # the |g⟩ confusion row
+        @test JSON.parse(JSON.json(preply)) == preply     # JSON-safe all the way down
+
+        # a poll of an already-run job is idempotent (the record persists)
+        pstatus2, preply2 = poll(host, port, job_id)
+        @test pstatus2 == 200 && preply2 == preply
+
+        # ── the no-sweep variant: the expts axis absent — (n_reads, 2)
+        status, reply = submit(host, port, nosweep)
+        _, preply = poll(host, port, reply["job_id"])
+        @test preply["status"] == "done"
+        @test length(preply["acquisition"]["iq"][1]) == 1 &&
+              length(preply["acquisition"]["iq"][1][1]) == 2
+
+        # ── a malformed payload is a FAILED JOB, not a server crash: the
+        # error rides the status dict (the reference agent's rule) and the
+        # next submit still runs
+        status, reply = submit(host, port, Dict("overlay_id" => "testbench-v2"))
+        @test status == 200
+        _, preply = poll(host, port, reply["job_id"])
+        @test preply["status"] == "error"
+        @test occursin("missing `program`", preply["error"])
+        status, reply = submit(host, port, golden)        # the server survived
+        _, preply = poll(host, port, reply["job_id"])
+        @test preply["status"] == "done"
+
+        # ── an unknown job id: 404, with the error as data
+        status, preply = poll(host, port, "no-such-job")
+        @test status == 404
+        @test preply["status"] == "error"
+        @test occursin("unknown job", preply["error"])
+
+        # ── an unknown route: 404 with a named error
+        sock = connect(host, port)
+        write(sock, "GET /nope HTTP/1.1\r\nHost: twin\r\nConnection: close\r\n\r\n")
+        resp = read(sock, String)
+        close(sock)
+        @test startswith(resp, "HTTP/1.1 404")
+
+        ext.stop_http(http)
     end
 end

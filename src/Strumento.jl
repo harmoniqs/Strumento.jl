@@ -73,6 +73,7 @@ include("twin.jl")
 export AbstractSoc
 export execute!, load_envelope!, play_program!, acquire, dac_rate, adc_rate
 export QickChannelMap, QickGenChannel
+export TwinWiringMap, TwinGenWiring, wiring_for
 export pulse_to_envelopes, QickProgram
 export iq_to_measurements, Measurement
 

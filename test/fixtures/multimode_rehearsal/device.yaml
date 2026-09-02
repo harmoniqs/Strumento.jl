@@ -1,0 +1,103 @@
+# multimode_rehearsal — the twin-rehearsal demo-class cQED device instance (issue #31).
+#
+# A demo-class device of the multimode family (the same topology + wiring shape as the
+# cqed pack's multimode_demo instance): a transmon dispersively coupled to a "manipulate"
+# cavity mode and two storage modes, with a driven coupler. This committed instance is
+# the rehearsal counterpart of the bosonic twin record (test/fixtures/twins/bosonic.md):
+# the twin's rotating-frame physics (see bosonic_system_builder) is carrier-agnostic,
+# and this device's calibration values are the rehearsal world's data — the line
+# frequencies live at the rehearsal overlay's slow fabric (fs 12.5 MHz), so every played
+# carrier lands in the declared Nyquist zone.
+#
+# Wiring: sideband=DAC0, coupler=DAC1, qubit=DAC2, manipulate=DAC3(nyq1), storage=DAC6,
+# readout=DAC5 + ADC0. The twin wires the qubit and manipulate generators to the
+# bosonic family's ancilla/cavity drive quadratures (the rig's TwinWiringMap).
+
+pack: cqed
+soccfg_snapshot: soccfg_v2_rehearsal.json
+
+wiring:
+  lines:
+    qubit:
+      name: qubit
+      generators:
+        - {role: drive,    dac_ch: 2, nyquist: 1, gen_type: full}
+        - {role: sideband, dac_ch: 0, nyquist: 1, gen_type: full}
+    manipulate:
+      name: manipulate
+      generators:
+        - {role: main, dac_ch: 3, nyquist: 1, gen_type: full}
+    storage:
+      name: storage
+      generators:
+        - {role: main, dac_ch: 6, nyquist: 1, gen_type: full}
+    coupler:
+      name: coupler
+      generators:
+        - {role: low,  dac_ch: 1, nyquist: 1, band_hz: [0.0, 1.8e9]}
+        - {role: high, dac_ch: 1, nyquist: 1, band_hz: [1.8e9, 1.0e12]}
+    readout:
+      name: readout
+      generators:
+        - {role: probe, dac_ch: 5, nyquist: 1, gen_type: full}
+  readout:
+    dac_ch: 5
+    adc_chs: [0]
+
+topology:
+  - {type: Transmon, name: qubit}
+  - {type: BosonicMode, name: manipulate, role: manipulate, line: manipulate, freq_mhz: 5.0}
+  - {type: BosonicMode, name: S1, role: storage, line: storage, freq_mhz: 6.0}
+  - {type: BosonicMode, name: S2, role: storage, line: storage, freq_mhz: 6.1}
+  - {type: Coupler, name: coupler}
+  - {type: ReadoutResonator, name: readout}
+
+aliases:
+  sideband: {element: qubit, ops: sideband}
+
+# The rehearsal calibration. The displacement entry is calibrated to the TWIN's frame
+# convention (the v1 wire passes the DAC fraction as the family drive coefficient, and
+# the cavity coherent amplitude is beta = (u/2)*integral(envelope)): displace gain 37
+# (int codes; 37/32766 ~ 0.00113 fraction) with sigma 1.0 us gives |beta| ~ sqrt(2) —
+# mean photon number ~2, the certification design's comb operating point. The
+# displacement_cal (gain fraction per |alpha|) is the same calibration stated per-alpha.
+calibration:
+  qubit:
+    f_ge: 4.0
+    f_ef: 3.8
+    T1: 100.0
+    T2: 50.0
+    T2_echo: 80.0
+    drag_alpha: 0.5
+    pulses:
+      pi_ge:  {gain: 8192, sigma: 0.030, length: 0.0, type: gauss}
+      hpi_ge: {gain: 4096, sigma: 0.030, length: 0.0, type: gauss}
+      pi_ef:  {gain: 7600, sigma: 0.030, length: 0.0, type: gauss}
+  readout:
+    frequency: 1.0
+    gain: 1000
+    readout_length: 2.0
+    trig_offset: 400
+    relax_delay: 500
+    phase: 0.0
+    threshold: 0.0
+    angle: 0.0
+  swaps:
+    manipulate-S1: {frequency: 0.8, gain: 9000, length: 2.4, ramp_sigma: 0.01}
+    manipulate-S2: {frequency: 0.95, gain: 9500, length: 2.6, ramp_sigma: 0.01}
+  modes:
+    manipulate:
+      revival_time: [1.6, 0.8]
+      displace: {gain: 37, sigma: 1.0, type: gauss}
+      T1: 2000.0
+      T2: 1000.0
+      chi: 0.2984
+      displacement_cal: 0.0007976
+    S1:
+      revival_time: [2.0]
+      T1: 5000.0
+      chi: 0.08
+    S2:
+      revival_time: [2.1]
+      T1: 4500.0
+      chi: 0.075

@@ -4,6 +4,7 @@ authors = ["Harmoniqs"]
 version = "0.3.0"
 
 [deps]
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"  # job-server ext (stdlib): NpEncoder envelope decode
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"  # twin core (absorbed from Sosia.jl): OU Gaussian noise
 GenericSchur = "c145ed77-6b09-5dd9-b285-bf645a82121e"  # transitive pin only: 0.5.7 breaks eigen! (RalphAS/GenericSchur.jl#24)
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"  # the extension testitems use it in the test env

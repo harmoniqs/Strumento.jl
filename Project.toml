@@ -14,16 +14,19 @@ TestItems = "1c621080-faea-4a02-84b6-bbd5e436b8fe"
 YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"  # twin core: vault record frontmatter
 
 [weakdeps]
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"  # wire trigger: the D14 job-server payload codec (issue #29)
 Piccolo = "c4671d76-df94-11ed-2057-43d4fd632fad"  # physics trigger: mock rollouts, AbstractPulse translation
 PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"  # bridge trigger: the Python delegation soc
 
 [extensions]
+StrumentoJobServerExt = ["Piccolo", "JSON"]  # TwinJobServer: the D14 wire contract (issue #29)
 StrumentoPiccoloExt = "Piccolo"      # MockSoc + the AbstractPulse translation/seam methods
 StrumentoPythonCallExt = "PythonCall"  # StrumentoSoc (the Python `strumento` delegation path)
 
 [compat]
 Distributions = "0.25"  # resolved 0.25.131 from General (issue #15)
 GenericSchur = "0.5.0 - 0.5.6"  # 0.5.7 piracy regression; drop when fixed
+JSON = "1.7"  # resolved 1.7.1 from General (issue #29); the wire codec
 LinearAlgebra = "1.11"
 Piccolo = "2.0"  # validated against 2.0.2 (issue #14 rollout re-grounding)
 PythonCall = "0.9"
@@ -41,9 +44,9 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"  # twin-core tests: stationa
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-# Piccolo + PythonCall ride the test target: `Pkg.test()` runs the FULL
-# configuration (both extensions loaded) — CI is unchanged. The base-only and
-# single-trigger configurations are checked by
+# Piccolo + PythonCall + JSON ride the test target: `Pkg.test()` runs the FULL
+# configuration (all three extensions loaded) — CI is unchanged. The base-only
+# and single-trigger configurations are checked by
 # test/configurations/load_config_check.jl (they cannot go through Pkg.test
 # by construction — the test target always injects the triggers).
-test = ["Piccolo", "PythonCall", "Statistics", "Test"]
+test = ["JSON", "Piccolo", "PythonCall", "Statistics", "Test"]

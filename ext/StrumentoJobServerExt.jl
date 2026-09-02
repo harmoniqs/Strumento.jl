@@ -21,7 +21,9 @@
 # carrier phase applied per wave) and the readout samples the post-drive state
 # per declared read; the sweep axis is realized from the payload's declared
 # loop structure (`loop_dims`/`avg_level`), never from simulating the loop
-# registers.
+# registers — while the CloseLoop sweep ladder's literal per-expt steps (qick's
+# encoding-A: read_wmem → wave-field increments → write_wmem, anchored inside
+# the expts loop) are read as static DATA, decoded not simulated.
 #
 # ─── The extension split + the wire-stack decisions (documented) ─────────────
 #

@@ -147,73 +147,117 @@ end
 # the ladder only carries the per-expt VALUES). Wave-field registers are qick's
 # own map (QickProgramV2.REG_ALIASES): w0 freq, w1 phase, w2 env, w3 gain,
 # w4 length, w5 conf.
+#
+# Anchoring: qick emits the ladder before the expts loop's back-edge (a
+# TEST/JUMP-IF-NZ pair whose literal counter is the expts count − 1 — checked
+# against the DECLARED axis, a consistency check, not a simulation), and a
+# restore ladder AFTER it (the compiler leaving wave memory as it found it,
+# once per reps iteration — invisible to the v1 response model, which batches
+# reps × soft_avgs into one accumulated draw). Only the IN-LOOP ladder
+# realizes per-expt steps; out-of-loop blocks are decoded and validated but
+# not realized.
 const _WAVE_FIELDS = Dict("w0" => "freq", "w1" => "phase", "w2" => "env",
                           "w3" => "gain", "w4" => "length", "w5" => "conf")
 
-function _sweep_ladder(program::AbstractDict, n_waves::Int)
-    ladder = Tuple{Int,String,Int}[]
-    seen_waves = Int[]
-    consumed = Int[]
+# One ladder block: (wave idx 1-based, [(field, step)...], write P_ADDR).
+function _ladder_block(insts, i::Int, n_waves::Int)
+    inst = insts[i]
+    addr = get(inst, "ADDR", nothing)
+    addr isa AbstractString && startswith(addr, "&") || error(
+        "read_payload: a wave-memory read (r_wave) carries ADDR $(repr(addr)) — " *
+        "the CloseLoop ladder's form is REG_WR r_wave SRC=wmem ADDR=\"&<index>\"")
+    widx = parse(Int, addr[2:end]) + 1        # the wave-table index, 1-based
+    1 ≤ widx ≤ n_waves || error(
+        "read_payload: the sweep ladder references wave $widx but the wave table " *
+        "holds $n_waves")
+    steps = Tuple{String,Int}[]
+    j = i + 1
+    while j ≤ length(insts) && get(insts[j], "CMD", "") != "WMEM_WR"
+        nxt = insts[j]
+        get(nxt, "CMD", "") == "REG_WR" || error(
+            "read_payload: an instruction inside the CloseLoop ladder is not a " *
+            "wave-field increment (CMD $(repr(get(nxt, "CMD", nothing)))) — v1 " *
+            "decodes the read → increment → write block")
+        dst = string(get(nxt, "DST", ""))
+        haskey(_WAVE_FIELDS, dst) || error(
+            "read_payload: the sweep ladder increments $(repr(dst)) — not a " *
+            "wave-field register (qick's map: freq/phase/env/gain/length/conf)")
+        op = string(get(nxt, "OP", ""))
+        m = match(r"^(\w+) ([+-]) #(-?\d+)$", op)
+        (m !== nothing && String(m[1]) == dst) || error(
+            "read_payload: the sweep ladder's increment on $(repr(dst)) carries " *
+            "OP $(repr(op)) — v1 decodes literal steps (\"w<k> ± #<step>\"), " *
+            "not register arithmetic")
+        push!(steps, (_WAVE_FIELDS[dst], (m[2] == "+" ? 1 : -1) * parse(Int, m[3])))
+        j += 1
+    end
+    j ≤ length(insts) || error(
+        "read_payload: a wave-memory read (r_wave) is never written back — the " *
+        "CloseLoop ladder's form is read → increments → WMEM_WR")
+    string(get(insts[j], "DST", "")) == "&$(widx - 1)" || error(
+        "read_payload: the sweep ladder reads wave $widx but writes " *
+        "$(repr(get(insts[j], "DST", nothing))) — the read and the write must " *
+        "target the same wave-table entry")
+    return (widx, steps, Int(get(insts[j], "P_ADDR", j)))
+end
+
+function _sweep_ladder(program::AbstractDict, n_waves::Int, expts::Union{Nothing,Int})
     insts = program["prog_list"]
+    has_ladder = any(i -> get(i, "CMD", "") == "REG_WR" &&
+                          get(i, "DST", "") == "r_wave" && get(i, "SRC", "") == "wmem",
+                     insts) ||
+                 any(i -> get(i, "CMD", "") == "WMEM_WR", insts)
+    isempty_any = !has_ladder
+    isempty_any && return Tuple{Int,String,Int}[]
+    # the expts loop's back-edge anchors the ladder split: the TEST whose
+    # literal counter is the DECLARED expts count − 1, followed by a
+    # conditional JUMP (the loop's increment-carrying back-edge)
+    expts isa Integer || error(
+        "read_payload: the payload carries a CloseLoop sweep ladder but declares " *
+        "no expts axis — a sweep needs a loop to ride")
+    back_edge = 0
+    for (i, inst) in enumerate(insts)
+        get(inst, "CMD", "") == "TEST" || continue
+        m = match(r"^r\d+ - #(\d+)$", string(get(inst, "OP", "")))
+        m !== nothing && parse(Int, m[1]) == expts - 1 || continue
+        i < length(insts) && get(insts[i+1], "CMD", "") == "JUMP" &&
+            haskey(insts[i+1], "IF") || continue
+        back_edge == 0 || error(
+            "read_payload: $back_edge-plus back-edges carry the expts counter " *
+            "#$(expts - 1) — the expts loop is not uniquely identifiable")
+        back_edge = Int(get(inst, "P_ADDR", i))
+    end
+    back_edge > 0 || error(
+        "read_payload: the payload carries a CloseLoop sweep ladder but no expts " *
+        "back-edge (TEST against #$(expts - 1) + conditional JUMP) — the sweep " *
+        "block cannot be located in the compiled program")
+    blocks = Tuple{Int,Vector{Tuple{String,Int}},Int}[]
     for (i, inst) in enumerate(insts)
         get(inst, "CMD", "") == "REG_WR" || continue
         get(inst, "DST", "") == "r_wave" || continue
         get(inst, "SRC", "") == "wmem" || continue
-        addr = get(inst, "ADDR", nothing)
-        addr isa AbstractString && startswith(addr, "&") || error(
-            "read_payload: a wave-memory read (r_wave) carries ADDR $(repr(addr)) — " *
-            "the CloseLoop ladder's form is REG_WR r_wave SRC=wmem ADDR=\"&<index>\"")
-        widx = parse(Int, addr[2:end]) + 1        # the wave-table index, 1-based
-        1 ≤ widx ≤ n_waves || error(
-            "read_payload: the sweep ladder references wave $widx but the wave table " *
-            "holds $n_waves")
-        push!(consumed, i)
-        # the literal field increments between the read and the matching write
-        steps = Tuple{String,Int}[]
-        j = i + 1
-        while j ≤ length(insts) && get(insts[j], "CMD", "") != "WMEM_WR"
-            nxt = insts[j]
-            get(nxt, "CMD", "") == "REG_WR" || error(
-                "read_payload: an instruction inside the CloseLoop ladder is not a " *
-                "wave-field increment (CMD $(repr(get(nxt, "CMD", nothing)))) — v1 " *
-                "decodes the read → increment → write block")
-            dst = string(get(nxt, "DST", ""))
-            haskey(_WAVE_FIELDS, dst) || error(
-                "read_payload: the sweep ladder increments $(repr(dst)) — not a " *
-                "wave-field register (qick's map: freq/phase/env/gain/length/conf)")
-            op = string(get(nxt, "OP", ""))
-            m = match(r"^(\w+) ([+-]) #(-?\d+)$", op)
-            (m !== nothing && String(m[1]) == dst) || error(
-                "read_payload: the sweep ladder's increment on $(repr(dst)) carries " *
-                "OP $(repr(op)) — v1 decodes literal steps (\"w<k> ± #<step>\"), " *
-                "not register arithmetic")
-            push!(steps, (_WAVE_FIELDS[dst], (m[2] == "+" ? 1 : -1) * parse(Int, m[3])))
-            push!(consumed, j)
-            j += 1
-        end
-        j ≤ length(insts) || error(
-            "read_payload: a wave-memory read (r_wave) is never written back — the " *
-            "CloseLoop ladder's form is read → increments → WMEM_WR")
-        push!(consumed, j)
-        string(get(insts[j], "DST", "")) == "&$(widx - 1)" || error(
-            "read_payload: the sweep ladder reads wave $widx but writes " *
-            "$(repr(get(insts[j], "DST", nothing))) — the read and the write must " *
-            "target the same wave-table entry")
+        push!(blocks, _ladder_block(insts, i, n_waves))
+    end
+    # every wave-memory write must belong to a decoded ladder — an orphan
+    # WMEM_WR mutates the wave table in a way v1 does not model
+    write_paddrs = Set{Int}(b[3] for b in blocks)
+    for (i, inst) in enumerate(insts)
+        get(inst, "CMD", "") == "WMEM_WR" || continue
+        Int(get(inst, "P_ADDR", i)) in write_paddrs || error(
+            "read_payload: a wave-memory write (WMEM_WR) sits outside the decoded " *
+            "CloseLoop ladder — v1 models the read → increment → write form only")
+    end
+    ladder = Tuple{Int,String,Int}[]
+    seen_waves = Int[]
+    for (widx, steps, write_paddr) in blocks
+        write_paddr < back_edge || continue    # the restore ladder: not realized
         widx in seen_waves && error(
-            "read_payload: the sweep ladder writes wave $widx twice — v1 decodes one " *
-            "ladder per wave")
+            "read_payload: the sweep ladder writes wave $widx twice inside the " *
+            "expts loop — v1 decodes one ladder per wave")
         push!(seen_waves, widx)
         for (field, step) in steps
             push!(ladder, (widx, field, step))
         end
-    end
-    # every wave-memory write must belong to a decoded ladder — an orphan
-    # WMEM_WR mutates the wave table in a way v1 does not model
-    for (i, inst) in enumerate(insts)
-        get(inst, "CMD", "") == "WMEM_WR" || continue
-        i in consumed || error(
-            "read_payload: a wave-memory write (WMEM_WR) sits outside the decoded " *
-            "CloseLoop ladder — v1 models the read → increment → write form only")
     end
     # v1 realizes GAIN steps only (the swept-amp form); anything else is named
     for (widx, field, step) in ladder
@@ -367,9 +411,6 @@ function read_payload(soccfg::AbstractDict, job_wire::AbstractDict)
         )
     end
 
-    # ── the CloseLoop sweep ladder (per-expt wave-field steps) ──
-    ladder = _sweep_ladder(program, length(waves))
-
     # ── the soccfg facts for the played generators (zone from the program) ──
     gen_cfg = Dict{Int,NamedTuple}(
         gen_ch => merge(_gen_facts(soccfg, gen_ch), (nqz = nqz(gen_ch),)) for
@@ -430,6 +471,8 @@ function read_payload(soccfg::AbstractDict, job_wire::AbstractDict)
             "$(derived_expts === nothing ? "no expts axis" : derived_expts) — " *
             "refusing a job whose declared shape does not match its program",
         )
+    # ── the CloseLoop sweep ladder (per-expt wave-field steps) ──
+    ladder = _sweep_ladder(program, length(waves), derived_expts)
     return WirePayload(
         string(job_wire["overlay_id"]),
         envelopes,
@@ -1213,5 +1256,65 @@ end
                         dac_rate = 9584.64),
                 soccfg; overlay_id = "testbench-v2", dt = 1.0),
             deepcopy(nosweep))["iq"][1]          # same seed replays the drift+response
+    end
+end
+
+@testitem "the real-span sweep's IQ trends with the ladder-stepped gain" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        TwinSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).TwinSoc
+        using Strumento: DriftPlan, instantiate
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures", "_fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "soccfg_v2_testbench.json"))
+        realspan = JSON.parsefile(joinpath(fixtures, "compiled_job_realspan.json"))
+        golden = JSON.parsefile(joinpath(fixtures, "compiled_job_golden.json"))
+        nosweep = JSON.parsefile(joinpath(fixtures, "compiled_job_nosweep.json"))
+        toy = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+
+        # the ladder is static data in the payload: the amp ladder steps the
+        # wave's gain by +819 codes per expt (the declared 0..8191 span
+        # register-rounded — the realized axis, what the tProc steps); the
+        # compiler's out-of-loop restore ladder (−9009) is decoded but never
+        # realized. Exact integers — no float goldens.
+        payload = ext.read_payload(soccfg, realspan)
+        @test payload.sweep_ladder == [(1, "gain", 819)]
+        @test ext.read_payload(soccfg, golden).sweep_ladder == []    # zero-span golden
+        @test ext.read_payload(soccfg, nosweep).sweep_ladder == []   # no sweep
+
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) =
+            QuantumSystem(truth[:omega] * σz, [σx, σx], [truth[:drive_bound], truth[:drive_bound]])
+        soc(exact) = TwinSoc(instantiate(toy; drift = DriftPlan(), seed = 0xC0FFEE),
+                             ComplexF64[1, 0], ComplexF64[0, 1];
+                             families = Dict("toy" => toy_family), exact = exact,
+                             dac_rate = 9584.64)
+        server = ext.TwinJobServer(soc(true), soccfg; overlay_id = "testbench-v2")
+
+        # the sweep axis: 11 expts from the declared loop structure, and the
+        # IQ magnitude TRENDS with the ladder-stepped gain — the amp sweep's
+        # whole point (semantic scale, never a captured cross-env literal).
+        # The toy's ω = 1.0 rad/ns drift detunes the wire's fractional drive,
+        # so the response is a resonance LOBE, not a monotone ramp: the rising
+        # edge is the trend (deterministic, exact mode), the last expt rounds
+        # the lobe's peak — the contract is the trend, not monotonicity.
+        out = ext.execute_job(server, realspan)
+        ch = out["iq"][1]
+        @test length(ch) == 1 && length(ch[1]) == 11
+        exc = [ch[1][e][2] for e in 1:11]
+        @test all(diff(exc[1:10]) .> 0)           # the rising edge: gain → excitation
+        @test maximum(exc) > exc[1] + 4e-4        # a real excursion, not rounding
+        @test exc[end] > exc[1]                   # the sweep ends above its start
+        # the trend is the DRIVE's doing: the first expt (gain 0) sits at the
+        # pure-|g⟩ confusion row, the same value the zero-span golden pins
+        @test exc[1] ≈ 0.02 atol = 1e-12
+        # JSON-safe all the way down (the wire contract)
+        @test JSON.parse(JSON.json(out)) == out
     end
 end

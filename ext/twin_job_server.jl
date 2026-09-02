@@ -1607,3 +1607,54 @@ end
         ext.stop_http(http)
     end
 end
+
+@testitem "seeded replay: identical seeds reproduce identical responses across fresh processes" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using JSON
+        # The twin's determinism claim, at the wire: two FRESH PROCESSES (fresh
+        # twins, fresh rngs, the same seed) produce BIT-IDENTICAL server
+        # responses — the JSON strings compare equal, a replay pin (==), not a
+        # captured-value golden (the campaign CI rule). Sampled mode: the shot
+        # draws are the seeded surface this pins.
+        mini = """
+        using Strumento, Piccolo, JSON
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        TwinSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).TwinSoc
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures", "_fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "soccfg_v2_testbench.json"))
+        golden = JSON.parsefile(joinpath(fixtures, "compiled_job_golden.json"))
+        toy = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) = QuantumSystem(truth[:omega] * σz, [σx, σx],
+                                          [truth[:drive_bound], truth[:drive_bound]])
+        seed = parse(UInt64, ARGS[1])
+        soc = TwinSoc(instantiate(toy; drift = DriftPlan(), seed = seed),
+                      ComplexF64[1, 0], ComplexF64[0, 1];
+                      families = Dict("toy" => toy_family), shots = 64,
+                      dac_rate = 9584.64)
+        server = ext.TwinJobServer(soc, soccfg; overlay_id = "testbench-v2")
+        println(JSON.json(ext.execute_job(server, golden)))
+        """
+        script = tempname()
+        write(script, mini)
+        proj = dirname(Base.active_project())   # the sandbox carries the test-target deps
+        run_one(seed::Integer) = begin
+            out = tempname()
+            run(pipeline(`$(Base.julia_cmd()) --startup-file=no --project=$proj $script $(UInt64(seed))`;
+                         stdout = out))
+            read(out, String)
+        end
+        r1 = run_one(0x5EED)
+        r2 = run_one(0x5EED)
+        r3 = run_one(0xFEED)
+        @test r1 == r2                    # identical seeds → identical wire responses
+        @test r1 != r3                    # different seeds → different draws
+        @test JSON.parse(r1) == JSON.parse(r2)   # ...and it is the wire form, parseable
+        rm(script; force = true)
+    end
+end

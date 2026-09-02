@@ -126,6 +126,45 @@ soc = StrumentoSoc("devices/multimode_demo/device.yaml";
                    dac_rate = 9.6e9, adc_rate = 2.4576e9, board = pyqicksoc)
 ```
 
+## The twin job server (D14 wire contract)
+
+With `Piccolo` **and** `JSON` loaded, the `StrumentoJobServerExt` extension attaches and
+the twin becomes a **board**: it speaks the Python stack's D14 wire contract — the
+`CompiledJob` wire form (qick's own `dump_prog()` dict serialized through `NpEncoder`)
+in, the `RawAcquisition` wire form out — so "swapping twin → real device is a registry-id
+change".
+
+```
+Python strumento   ->  CompiledJob.to_wire()   ->  TwinJobServer (HTTP/JSON)  ->  RawAcquisition
+  (build+compile)        {overlay_id, program,       read → envelope-level          {"iq": [(n_reads,
+                          acquire}                    translate → twin face          [expts,] 2) per
+                                                      → shape per acquire            channel, lists]
+```
+
+- **The boundary, explicit**: the twin models the DEVICE response at the **envelope
+  level** — the envelope pages, the wave-table assignments, the CloseLoop sweep ladder's
+  literal per-expt steps (read as static data, anchored inside the expts loop), the
+  declared loop structure, the acquire block — and **never** interprets the tProc program
+  (register semantics, trigger scheduling, branching: the assembly-faithful lane is
+  Python `SimulatorSoc`'s; the two lanes are complementary — a rehearsal claim runs at
+  the envelope level, where the physics lives).
+- **The queue is the reference agent's shape** (`strumento`'s `examples/jobserver/`):
+  submit enqueues FIFO, a poll is the single worker's turn, the status dicts are
+  `pending` / `done` + acquisition / `error` + message, a failed job never takes the
+  server down, and the declared acquire shape is refused on mismatch (the one place a
+  dumb executor is picky).
+- **The HTTP layer is stdlib** (`Sockets`): two routes — `POST /jobs`,
+  `GET /jobs/<id>` (unknown ids 404) — one request per connection; no package dependency
+  edge.
+- **The server is a soc-level actor** over one `TwinSoc`: the drift advances ACROSS jobs
+  (its own clock, `dt` per job; the soc's per-acquire `dt` stays 0) — job *k* measures
+  truth aged `(k-1)·dt`, which is the rehearsal point.
+- **Conventions** (documented in `execute_job`'s docstring): quantum time in ns
+  (`dac_rate = fs` in samples per ns), the v1 amplitude scale (a full-scale DAC drive is
+  1.0 family unit; a calibrated rad/ns-per-full-scale mapping is future record surface),
+  and the sweep axis realized from the declared loop structure — the IQ-trend evidence
+  rides the committed real-span fixture.
+
 ## Data-provenance note
 
 `StrumentoBackend`'s `last_raw` stash and the `ExperimentRecord` logging discussion moved
@@ -143,7 +182,10 @@ truth/belief contract) is absorbed from Sosia.jl (issue #15); the twin's soc fac
 transmon-ancilla–cavity system with Lindblad decay, from the twin's current truth
 (issue #21) — ride the Piccolo extension, which also rolls `OpenQuantumSystem` family
 builders through the Lindblad master equation. Family physics factories for the other
-families (transmon, spin, atoms) and the wire server are later slices.
+families (transmon, spin, atoms) ride the Piccolo extension; the twin job server — the
+D14 wire contract (`CompiledJob` in, `RawAcquisition` out) over HTTP/JSON, the envelope
+level, the queue + stdlib HTTP layer — landed with issue #29 (the `StrumentoJobServerExt`
+extension, `Piccolo` + `JSON` triggers).
 Calibration routines and multi-board orchestration remain out of scope. The
 weakdeps/extensions split (issue #16) is done: Piccolo and PythonCall are package
 extensions — the base package (contract + twins) loads in an environment with neither,

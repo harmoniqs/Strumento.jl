@@ -40,7 +40,8 @@ end
 """The decoded `CompiledJob`: what the envelope-level translation and the
 output shaping need. The tProc lane (`prog_list`/`labels`) is read ONLY for
 the static port-assignment pairing (which wave plays on which generator —
-qick's own dump pairing), never interpreted for control flow."""
+qick's own dump pairing) and the CloseLoop sweep ladder (see below), never
+interpreted for control flow."""
 struct WirePayload
     overlay_id::String
     envelopes::Dict{Int,Vector{EnvelopePage}}   # gen ch => pages in table order
@@ -56,6 +57,7 @@ struct WirePayload
     ro_chs::Vector{Int}
     reads_per_shot::Vector{Int}
     expts::Union{Nothing,Int}
+    sweep_ladder::Vector{Tuple{Int,String,Int}} # (wave idx 1-based, field, per-expt step)
 end
 
 # The soccfg facts a played generator contributes (fs in Hz, sample-memory
@@ -138,6 +140,90 @@ function _decode_conf(conf::Int, name::String)
     )
 end
 
+# The CloseLoop sweep ladder (qick's encoding-A form): read_wmem → wave-field
+# increments → write_wmem, compiled INSIDE the expts loop. Reading it is static
+# DATA extraction — the literal per-expt step the payload carries — never tProc
+# register simulation (the expts AXIS still rides the declared loop structure;
+# the ladder only carries the per-expt VALUES). Wave-field registers are qick's
+# own map (QickProgramV2.REG_ALIASES): w0 freq, w1 phase, w2 env, w3 gain,
+# w4 length, w5 conf.
+const _WAVE_FIELDS = Dict("w0" => "freq", "w1" => "phase", "w2" => "env",
+                          "w3" => "gain", "w4" => "length", "w5" => "conf")
+
+function _sweep_ladder(program::AbstractDict, n_waves::Int)
+    ladder = Tuple{Int,String,Int}[]
+    seen_waves = Int[]
+    consumed = Int[]
+    insts = program["prog_list"]
+    for (i, inst) in enumerate(insts)
+        get(inst, "CMD", "") == "REG_WR" || continue
+        get(inst, "DST", "") == "r_wave" || continue
+        get(inst, "SRC", "") == "wmem" || continue
+        addr = get(inst, "ADDR", nothing)
+        addr isa AbstractString && startswith(addr, "&") || error(
+            "read_payload: a wave-memory read (r_wave) carries ADDR $(repr(addr)) — " *
+            "the CloseLoop ladder's form is REG_WR r_wave SRC=wmem ADDR=\"&<index>\"")
+        widx = parse(Int, addr[2:end]) + 1        # the wave-table index, 1-based
+        1 ≤ widx ≤ n_waves || error(
+            "read_payload: the sweep ladder references wave $widx but the wave table " *
+            "holds $n_waves")
+        push!(consumed, i)
+        # the literal field increments between the read and the matching write
+        steps = Tuple{String,Int}[]
+        j = i + 1
+        while j ≤ length(insts) && get(insts[j], "CMD", "") != "WMEM_WR"
+            nxt = insts[j]
+            get(nxt, "CMD", "") == "REG_WR" || error(
+                "read_payload: an instruction inside the CloseLoop ladder is not a " *
+                "wave-field increment (CMD $(repr(get(nxt, "CMD", nothing)))) — v1 " *
+                "decodes the read → increment → write block")
+            dst = string(get(nxt, "DST", ""))
+            haskey(_WAVE_FIELDS, dst) || error(
+                "read_payload: the sweep ladder increments $(repr(dst)) — not a " *
+                "wave-field register (qick's map: freq/phase/env/gain/length/conf)")
+            op = string(get(nxt, "OP", ""))
+            m = match(r"^(\w+) ([+-]) #(-?\d+)$", op)
+            (m !== nothing && String(m[1]) == dst) || error(
+                "read_payload: the sweep ladder's increment on $(repr(dst)) carries " *
+                "OP $(repr(op)) — v1 decodes literal steps (\"w<k> ± #<step>\"), " *
+                "not register arithmetic")
+            push!(steps, (_WAVE_FIELDS[dst], (m[2] == "+" ? 1 : -1) * parse(Int, m[3])))
+            push!(consumed, j)
+            j += 1
+        end
+        j ≤ length(insts) || error(
+            "read_payload: a wave-memory read (r_wave) is never written back — the " *
+            "CloseLoop ladder's form is read → increments → WMEM_WR")
+        push!(consumed, j)
+        string(get(insts[j], "DST", "")) == "&$(widx - 1)" || error(
+            "read_payload: the sweep ladder reads wave $widx but writes " *
+            "$(repr(get(insts[j], "DST", nothing))) — the read and the write must " *
+            "target the same wave-table entry")
+        widx in seen_waves && error(
+            "read_payload: the sweep ladder writes wave $widx twice — v1 decodes one " *
+            "ladder per wave")
+        push!(seen_waves, widx)
+        for (field, step) in steps
+            push!(ladder, (widx, field, step))
+        end
+    end
+    # every wave-memory write must belong to a decoded ladder — an orphan
+    # WMEM_WR mutates the wave table in a way v1 does not model
+    for (i, inst) in enumerate(insts)
+        get(inst, "CMD", "") == "WMEM_WR" || continue
+        i in consumed || error(
+            "read_payload: a wave-memory write (WMEM_WR) sits outside the decoded " *
+            "CloseLoop ladder — v1 models the read → increment → write form only")
+    end
+    # v1 realizes GAIN steps only (the swept-amp form); anything else is named
+    for (widx, field, step) in ladder
+        field == "gain" || error(
+            "read_payload: the sweep ladder steps wave $widx's $field — v1 realizes " *
+            "gain steps only (the swept-amp form)")
+    end
+    return ladder
+end
+
 """
     read_payload(soccfg, job_wire) -> WirePayload
 
@@ -149,7 +235,10 @@ pages via `decode_array` (base64 int16 (n, 2) I/Q), the wave codes via
 via the `WPORT_WR` port-assignment table. The sweep axis is realized from the
 DECLARED loop structure (`loop_dims`/`avg_level`), never from tProc register
 semantics — the axis is the product of the loop dimensions with the averaged
-axis removed.
+axis removed. The per-expt VALUES ride the CloseLoop ladder when the payload
+carries one (`_sweep_ladder`): qick's encoding-A sweep block (read_wmem →
+literal wave-field increments → write_wmem) is static data in the payload,
+decoded — not register-simulated — into per-expt wave-field steps.
 """
 function read_payload(soccfg::AbstractDict, job_wire::AbstractDict)
     for key in ("overlay_id", "program", "acquire")
@@ -278,6 +367,9 @@ function read_payload(soccfg::AbstractDict, job_wire::AbstractDict)
         )
     end
 
+    # ── the CloseLoop sweep ladder (per-expt wave-field steps) ──
+    ladder = _sweep_ladder(program, length(waves))
+
     # ── the soccfg facts for the played generators (zone from the program) ──
     gen_cfg = Dict{Int,NamedTuple}(
         gen_ch => merge(_gen_facts(soccfg, gen_ch), (nqz = nqz(gen_ch),)) for
@@ -355,6 +447,7 @@ function read_payload(soccfg::AbstractDict, job_wire::AbstractDict)
         ro_chs,
         reads_per_shot,
         derived_expts,
+        ladder,
     )
 end
 
@@ -409,9 +502,11 @@ function _wave_segment(payload::WirePayload, gen_ch::Int, wave::WireWave)
 end
 
 """
-    translate_drive(payload) -> Dict{gen_ch => GenDrive}
+    translate_drive(payload; expt = 1) -> Dict{gen_ch => GenDrive}
 
-Reconstruct the analog drive per generator channel, at the envelope level.
+Reconstruct the analog drive per generator channel, at the envelope level, for
+experiment point `expt` (1-based — the expts axis realized from the declared
+loop structure).
 
 Per wave (in the port plan's play order): the envelope segment is scaled from
 DAC codes to fractions of full scale (`code/maxv`), the gain is applied as the
@@ -424,6 +519,11 @@ frame), "dds" (a constant drive at the gain, no envelope — the const-pulse
 path), "input" (the envelope's real part × gain), "zero" (silence for the
 wave's extent).
 
+The CloseLoop ladder (when the payload carries one) offsets the stepped wave's
+gain code by `step × (expt − 1)` — the per-expt drive variation the compiled
+sweep declares, decoded in `read_payload`. A payload with no ladder replays
+the identical assignment for every `expt`.
+
 The carrier frequency is validated against the declared Nyquist zone and
 carried as the drive's frame definition. The v1 boundary (module docstring):
 the twin's family systems are rotating-frame models at the drive frequency, so
@@ -431,7 +531,8 @@ the carrier enters the response as the frame; a family that carries absolute
 transition frequencies would need the detuning, which is future record
 surface, not v1.
 """
-function translate_drive(payload::WirePayload)
+function translate_drive(payload::WirePayload; expt::Integer = 1)
+    expt ≥ 1 || error("translate_drive: expt must be ≥ 1 (got $expt)")
     drives = Dict{Int,GenDrive}()
     for (gen_ch, wave_idxs) in payload.port_plan
         facts = payload.gen_cfg[gen_ch]
@@ -440,6 +541,12 @@ function translate_drive(payload::WirePayload)
         carriers = Float64[]
         for idx in wave_idxs
             wave = payload.waves[idx]
+            # this expt's gain code: the wave-table value plus the CloseLoop
+            # ladder's per-expt offsets (identical for every expt when absent)
+            gain_code = wave.gain_code
+            for (widx, field, step) in payload.sweep_ladder
+                widx == idx && field == "gain" && (gain_code += step * (expt - 1))
+            end
             # the Nyquist-zone band check (qick's freq2reg range contract)
             f = wave.freq_MHz
             fs = facts.f_dds_MHz
@@ -451,7 +558,7 @@ function translate_drive(payload::WirePayload)
                 "declared zone",
             )
             push!(carriers, f)
-            g = wave.gain_code / facts.maxv
+            g = gain_code / facts.maxv
             nsamp = wave.length_cycles * facts.samps_per_clk
             if wave.outsel == "dds"
                 φ = deg2rad(wave.phase_deg)
@@ -483,6 +590,192 @@ function translate_drive(payload::WirePayload)
         drives[gen_ch] = GenDrive(times, uI_all, uQ_all, carriers)
     end
     return drives
+end
+
+# ──── The server: a soc-level actor over one twin face ───────────────────────
+
+# The twin's soc type, reached LAZILY: it is defined by the sibling Piccolo
+# extension, and extension load order between siblings is not guaranteed —
+# the reach happens at construction time, when both triggers are loaded.
+_twinsoc_type() = begin
+    ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+    ext === nothing && error(
+        "TwinJobServer: the twin soc type is not loaded — it is defined by " *
+        "StrumentoPiccoloExt (load Piccolo together with JSON to attach " *
+        "this extension's triggers)")
+    return ext.TwinSoc
+end
+
+"""
+    TwinJobServer(soc, soccfg; overlay_id="", overlays=(), dt=0.0)
+
+A board-shaped job server fronting one `TwinSoc` (the twin face: family
+system from the twin's truth, the record's readout confusion, binomial shot
+sampling, the twin's own seeded rng). `soccfg` is the overlay's `dump_cfg()`
+snapshot (a parsed JSON dict) — one overlay ⇔ one snapshot (D25), so the
+server can decode a payload's envelope addressing and DDS codes. `overlay_id`
+names the personality this board serves; `overlays` (when non-empty) is the
+board's catalog — a named overlay outside it is a failed job, not a guess. `dt`
+is the twin-time (days) advanced AFTER each job: the server is a soc-level
+actor that serves many jobs against one twin, and the drift advances ACROSS
+jobs — job *k* measures truth aged `(k-1)·dt`. Construct the soc with its own
+per-acquire `dt = 0` and let the server own the clock.
+
+Execution (see `execute_job`): read → translate → the soc's own
+load/play/acquire path (the same seeded-response machinery, drift included)
+→ the `RawAcquisition` wire form.
+"""
+mutable struct TwinJobServer
+    soc                            # the TwinSoc (validated at construction)
+    soccfg                         # the overlay's dump_cfg() snapshot (parsed JSON)
+    overlay_id::String
+    overlays::Tuple{Vararg{String}}
+    dt::Float64
+end
+
+function TwinJobServer(soc, soccfg::AbstractDict;
+                       overlay_id::AbstractString = "",
+                       overlays::Tuple{Vararg{String}} = (),
+                       dt::Real = 0.0)
+    TwinSocT = _twinsoc_type()
+    soc isa TwinSocT || error(
+        "TwinJobServer: the soc must be a TwinSoc (got $(typeof(soc))) — the " *
+        "server fronts the twin face (family + confusion + seeded response)")
+    dt ≥ 0 || error(
+        "TwinJobServer: dt must be ≥ 0 — twin-time only runs forward (got $dt)")
+    return TwinJobServer(soc, soccfg, String(overlay_id), overlays, Float64(dt))
+end
+
+# The overlay personality (D25: one overlay ⇔ one snapshot). "" means whatever
+# is loaded — the single-personality case; a named overlay this board does
+# not have is a failed job (running a program compiled against a different
+# soccfg is exactly the class of error the 1:1 rule exists to prevent).
+function _select_overlay(server::TwinJobServer, overlay_id::AbstractString)
+    (overlay_id == "" || overlay_id == server.overlay_id) && return nothing
+    if !isempty(server.overlays) && overlay_id ∉ server.overlays
+        error(
+            "TwinJobServer: overlay $(repr(overlay_id)) is not available on this " *
+            "board (have: $(isempty(server.overlays) ?
+                "any (single-personality)" : join(server.overlays, ", ")))")
+    end
+    error(
+        "TwinJobServer: job asks for overlay $(repr(overlay_id)) but this " *
+        "server serves $(repr(server.overlay_id)) — one overlay is one soccfg " *
+        "snapshot (D25); refusing to run a program against a different snapshot")
+end
+
+"""
+    execute_job(server, job_wire) -> Dict   # the RawAcquisition wire form
+
+Run one `CompiledJob` wire dict through the twin face and shape the response
+per the acquire block: `{"iq" => [per readout channel]}` where each channel's
+array is `(n_reads, [expts,] 2)` IQ — JSON-safe lists all the way down.
+
+The execution path, per experiment point: the translated drive is loaded into
+the soc (its own `load_envelope!`/`play_program!` verbs) and acquired (its own
+`acquire` — the rollout over the family system built from the twin's CURRENT
+truth, the record's confusion remap, the twin's seeded binomial shots). The
+readout samples the state at the END of the played drive (the trigger
+schedule is the tProc's lane — control flow, the complementary boundary).
+
+Conventions this path owns (documented, the honest v1):
+
+- **Quantum time.** The wire grid is seconds; the twin families speak quantum
+  time in nanoseconds (the bosonic builder's unit table: rad·GHz ↔ ns rollout
+  time; Piccolo's convention). The server hands the soc the DAC grid in ns —
+  construct the soc with `dac_rate = fs` in samples PER NS.
+- **Amplitude scale.** The wire's drive is a fraction of DAC full scale
+  (envelope code × gain code, each over `maxv`); the v1 server passes that
+  fraction to the family AS the drive coefficient in the family's own quantum
+  units — full scale is 1.0 family unit (the toy's `drive_bound`). A
+  calibrated rad/ns-per-full-scale mapping is future record surface, not v1.
+- **Averaging depth.** The acquire block's `reps × soft_avgs` is the
+  accumulated-buffer statistic: one rollout per (read, expt), with the shot
+  draws batched to `soc.shots × reps × soft_avgs` — the sum over rounds of
+  per-round counts over the total, exactly what an accumulating readout
+  computes. All draws come from the twin's single seeded rng.
+- **The IQ packing.** The twin's v1 response blob is the confusion-remapped
+  outcome-frequency vector; a 2-outcome readout packs its two frequencies
+  into the wire's `(I, Q)` slots in level order (lossless, invertible — the
+  IQ-plane-per-state readout model is future record surface).
+- **The expts axis.** Realized from the payload's declared loop structure
+  (`loop_dims` minus the averaged axis); per-expt drive variation rides the
+  payload's CloseLoop ladder (see `read_payload`) when it carries one.
+- **The wire form.** Each channel's IQ is JSON-safe nested lists shaped
+  `(n_reads, [expts,] 2)` — the expts level ABSENT when the payload declares
+  no sweep — exactly what Python's `RawAcquisition.to_wire` (`.tolist()`)
+  puts on the wire and its `from_wire` (`np.asarray`) reconstructs.
+"""
+function execute_job(server::TwinJobServer, job_wire::AbstractDict)
+    _select_overlay(server, String(get(job_wire, "overlay_id", "")))
+    payload = read_payload(server.soccfg, job_wire)
+    # the v1 response model serves one readout channel (the record's single
+    # confusion); a multi-channel board is future twin surface
+    length(payload.ro_chs) == 1 || error(
+        "execute_job: the acquire block declares $(length(payload.ro_chs)) readout " *
+        "channels but the twin's v1 response model serves one (the record's " *
+        "readout_confusion is a single readout's model)")
+    n_reads = payload.reads_per_shot[1]
+    n_reads ≥ 1 || error("execute_job: reads_per_shot must be ≥ 1 (got $n_reads)")
+    expts = payload.expts === nothing ? 1 : payload.expts
+    # per-expt rollout values, packed into the wire form at the end
+    vals = Array{Float64}(undef, n_reads, expts, 2)
+
+    # the averaging depth: reps x soft_avgs rounds of the soc's own shot
+    # count, batched into one accumulated draw — the buffer statistic
+    soc = server.soc
+    shots_base = soc.shots
+    try
+        soc.shots = shots_base * payload.reps * payload.soft_avgs
+        for e in 1:expts
+            # this expt's drive: the same wave-table assignment replayed, with
+            # the CloseLoop ladder's per-expt field offsets when the payload
+            # carries one (all expts identical when it does not)
+            drives = translate_drive(payload; expt = e)
+            nsamp = maximum(length(d.times) for d in values(drives))
+            gen_chs = sort(collect(keys(drives)))
+            times = [1e9 * (i - 1) / payload.gen_cfg[gen_chs[1]].fs_hz for i in 1:nsamp]
+            envelopes = Dict{Int,Tuple{Vector{Float64},Vector{Float64}}}()
+            carriers = Dict{Int,Float64}()
+            routing = Tuple{Int,Int,Union{Int,Nothing}}[]
+            for (k, gen_ch) in enumerate(gen_chs)
+                d = drives[gen_ch]
+                pad = zeros(nsamp - length(d.times))
+                envelopes[gen_ch] = (vcat(d.uI, pad), vcat(d.uQ, pad))
+                carriers[gen_ch] = isempty(d.carriers_MHz) ? 0.0 : d.carriers_MHz[end]
+                push!(routing, (gen_ch, 2k - 1, 2k))
+            end
+            program = QickProgram(times, envelopes, carriers, routing,
+                                   2 * length(gen_chs), [nsamp])
+            for (gen_ch, (uI, uQ)) in envelopes
+                load_envelope!(soc, gen_ch, uI, uQ)
+            end
+            play_program!(soc, program)
+            for r in 1:n_reads
+                blob = acquire(soc, Int[])[1]   # one measurement index: the drive's end
+                length(blob) == 2 || error(
+                    "execute_job: the twin's response blob has $(length(blob)) " *
+                    "outcomes but the wire's IQ slot is 2 wide — the v1 packing " *
+                    "serves 2-outcome readouts (the record's confusion shape)")
+                vals[r, e, 1] = real(blob[1])
+                vals[r, e, 2] = real(blob[2])
+            end
+        end
+    finally
+        soc.shots = shots_base
+    end
+    # the soc-level actor's clock: drift advances ACROSS jobs, once per job
+    server.dt > 0 && advance!(soc.twin, server.dt)
+    # the RawAcquisition wire form: (n_reads, [expts,] 2) as JSON-safe nested
+    # lists, one level per declared axis — the expts level ABSENT when the
+    # payload declares no sweep (the Python client's np.asarray reconstructs
+    # exactly these two shapes)
+    iq = if payload.expts === nothing
+        [[vals[r, 1, 1], vals[r, 1, 2]] for r in 1:n_reads]
+    else
+        [[[vals[r, e, 1], vals[r, e, 2]] for e in 1:expts] for r in 1:n_reads]
+    end
+    return Dict{String,Any}("iq" => Any[iq])
 end
 
 @testitem "the twin job server rides its own Piccolo+JSON extension" begin
@@ -811,5 +1104,114 @@ end
         end
         @test err isa ErrorException
         @test occursin("Nyquist", sprint(showerror, err))
+    end
+end
+
+@testitem "execute_job runs the wire payload through the twin face and shapes RawAcquisition" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        using LinearAlgebra
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        TwinSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).TwinSoc
+        using Strumento: DriftPlan, instantiate, OrnsteinUhlenbeck
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures", "_fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "soccfg_v2_testbench.json"))
+        golden = JSON.parsefile(joinpath(fixtures, "compiled_job_golden.json"))
+        nosweep = JSON.parsefile(joinpath(fixtures, "compiled_job_nosweep.json"))
+        toy = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) =
+            QuantumSystem(truth[:omega] * σz, [σx, σx], [truth[:drive_bound], truth[:drive_bound]])
+        # wire service: the soc speaks the families' quantum time (ns), so its
+        # dac_rate is the generator's fs in samples PER NS (9584.64 MHz -> 9584.64/ns)
+        soc(exact) = TwinSoc(instantiate(toy; drift = DriftPlan(), seed = 0xC0FFEE),
+                             ComplexF64[1, 0], ComplexF64[0, 1];
+                             families = Dict("toy" => toy_family), exact = exact,
+                             dac_rate = 9584.64)
+
+        server = ext.TwinJobServer(soc(true), soccfg; overlay_id = "testbench-v2")
+
+        # ── the golden: 11 expts x 1 read x 2, the gain-0 drive leaving the
+        # qubit in |g> — the exact confused response is the record's first
+        # confusion column (semantic, computed from the record — no captures).
+        out = ext.execute_job(server, golden)
+        @test sort!(collect(keys(out))) == ["iq"]
+        @test length(out["iq"]) == 1                       # one readout channel
+        ch = out["iq"][1]
+        # the wire form: (n_reads, expts, I/Q) as JSON-safe nested lists
+        @test length(ch) == 1 && length(ch[1]) == 11 && all(v -> length(v) == 2, ch[1])
+        C = [0.98 0.02; 0.04 0.96]                          # the toy record's confusion
+        for e in 1:11
+            @test ch[1][e][1] ≈ C[1, 1] atol = 1e-12   # |g> in: the confusion ROW is the outcome distribution
+            @test ch[1][e][2] ≈ C[1, 2] atol = 1e-12
+        end
+        # JSON-safe all the way down (the wire contract)
+        @test JSON.parse(JSON.json(out)) == out
+
+        # ── the no-sweep variant: no expts axis — (n_reads, 2)
+        out_ns = ext.execute_job(server, nosweep)
+        ch_ns = out_ns["iq"][1]
+        @test length(ch_ns) == 1 && length(ch_ns[1]) == 2     # (n_reads, I/Q), no expts level
+        @test sum(ch_ns[1]) ≈ 1.0 atol = 1e-9
+        # the pi pulse MOVED the state: more excited-state frequency than the
+        # gain-0 golden's pure-|g⟩ confusion row (semantic scale, never a
+        # captured literal). The toy's ω = 1.0 rad/ns drift detunes the wire's
+        # fractional drive (peak 0.25 of full scale — the v1 amplitude
+        # convention above), so the moved amount is small by construction.
+        @test ch_ns[1][2] > C[1, 2]
+
+        # ── the overlay personality: a named overlay this board does not have
+        # is a failed job, not a guess (the reference agent's rule, D25)
+        err = try
+            ext.execute_job(server, merge(deepcopy(golden), Dict("overlay_id" => "other-v2")));
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("other-v2", sprint(showerror, err))
+
+        # ── seeded replay, bit-exact: two FRESH servers (fresh twins, fresh
+        # rngs) with the same seed — sampled responses (shots on) — produce
+        # identical wire outputs, always. Different seeds differ.
+        run_sampled(seed) = begin
+            s = ext.TwinJobServer(
+                TwinSoc(instantiate(toy; drift = DriftPlan(), seed = seed),
+                        ComplexF64[1, 0], ComplexF64[0, 1];
+                        families = Dict("toy" => toy_family),
+                        shots = 64, dac_rate = 9584.64),
+                soccfg; overlay_id = "testbench-v2")
+            ext.execute_job(s, deepcopy(golden))
+        end
+        @test run_sampled(0x5EED) == run_sampled(0x5EED)
+        @test run_sampled(0x5EED) != run_sampled(0xFEED)
+
+        # ── the server is a soc-level actor: drift advances ACROSS JOBS
+        # (twin time moves — the rehearsal point). Same payload, aged truth.
+        plan = DriftPlan(:omega => [OrnsteinUhlenbeck(theta = 0.1, sigma = 0.2, mu = 1.0)])
+        drifting = ext.TwinJobServer(
+            TwinSoc(instantiate(toy; drift = plan, seed = 7),
+                    ComplexF64[1, 0], ComplexF64[0, 1];
+                    families = Dict("toy" => toy_family), exact = true, dac_rate = 9584.64),
+            soccfg; overlay_id = "testbench-v2", dt = 1.0)
+        r1 = ext.execute_job(drifting, deepcopy(nosweep))["iq"][1]
+        r2 = ext.execute_job(drifting, deepcopy(nosweep))["iq"][1]
+        @test r1 != r2                          # truth aged between jobs
+        @test drifting.soc.twin.t == 2.0         # the twin clock moved once per job
+        @test r1 == ext.execute_job(
+            ext.TwinJobServer(
+                TwinSoc(instantiate(toy; drift = plan, seed = 7),
+                        ComplexF64[1, 0], ComplexF64[0, 1];
+                        families = Dict("toy" => toy_family), exact = true,
+                        dac_rate = 9584.64),
+                soccfg; overlay_id = "testbench-v2", dt = 1.0),
+            deepcopy(nosweep))["iq"][1]          # same seed replays the drift+response
     end
 end

@@ -358,6 +358,133 @@ function read_payload(soccfg::AbstractDict, job_wire::AbstractDict)
     )
 end
 
+# ──── The envelope-level translation ─────────────────────────────────────────
+# The analog drive the DEVICE would play, reconstructed from the wave table:
+# envelope samples scaled from DAC codes, gain applied per wave, the carrier
+# phase rotated into the baseband quadratures, the carrier frequency validated
+# against the declared Nyquist zone and carried as the frame definition.
+
+"""One generator channel's reconstructed drive: the baseband quadrature
+waveforms `uI`/`uQ` on the DAC-grid `times` (seconds), and the per-segment
+`carriers_MHz` (validated, carried as the drive's frame definition — see the
+module docstring for the v1 boundary)."""
+struct GenDrive
+    times::Vector{Float64}
+    uI::Vector{Float64}
+    uQ::Vector{Float64}
+    carriers_MHz::Vector{Float64}
+end
+
+# The envelope segment a wave plays: wave.env is the envelope word address
+# (samples // samps_per_clk); the wave plays `length` fabric cycles of the
+# page that holds that address, starting at the word offset. flat_top's
+# ramp-down (env pointing into the same page, later) resolves the same way.
+function _wave_segment(payload::WirePayload, gen_ch::Int, wave::WireWave)
+    facts = payload.gen_cfg[gen_ch]
+    spc = facts.samps_per_clk
+    nsamp = wave.length_cycles * spc
+    nsamp > 0 || error(
+        "translate_drive: wave $(repr(wave.name)) has length $(wave.length_cycles) " *
+        "cycles — a played wave must have positive extent",
+    )
+    want_word = wave.env_addr
+    for page in payload.envelopes[gen_ch]
+        word_addr = page.addr ÷ spc
+        word_end = (page.addr + length(page.idata)) ÷ spc
+        word_addr <= want_word < word_end || continue
+        off = (want_word * spc - page.addr) + 1        # 1-based sample offset into the page
+        off + nsamp - 1 ≤ length(page.idata) || error(
+            "translate_drive: wave $(repr(wave.name)) plays $nsamp samples " *
+            "($((wave.length_cycles)) cycles x $spc) from envelope word $want_word " *
+            "but page $(repr(page.name)) (addr $(page.addr), $(length(page.idata)) " *
+            "samples) does not reach that far — the wave outruns its envelope",
+        )
+        return view(page.idata, off:(off+nsamp-1)), view(page.qdata, off:(off+nsamp-1))
+    end
+    return error(
+        "translate_drive: wave $(repr(wave.name)) references envelope word " *
+        "$(wave.env_addr) on generator $gen_ch but the payload's pages for that " *
+        "channel hold no segment there — the wave table and the envelopes disagree",
+    )
+end
+
+"""
+    translate_drive(payload) -> Dict{gen_ch => GenDrive}
+
+Reconstruct the analog drive per generator channel, at the envelope level.
+
+Per wave (in the port plan's play order): the envelope segment is scaled from
+DAC codes to fractions of full scale (`code/maxv`), the gain is applied as the
+amplitude scale (`gain_code/maxv` — qick's "gain: −1.0 to 1.0 relative to max
+amplitude"), the carrier phase rotates the baseband quadratures, and the
+segments concatenate in play order (the flat-top shape; inter-wave TIMING is
+the tProc's — control flow, the complementary lane). `outsel` is honored per
+qick's cfg2reg semantics: "product" (envelope × gain, the DDS applied as the
+frame), "dds" (a constant drive at the gain, no envelope — the const-pulse
+path), "input" (the envelope's real part × gain), "zero" (silence for the
+wave's extent).
+
+The carrier frequency is validated against the declared Nyquist zone and
+carried as the drive's frame definition. The v1 boundary (module docstring):
+the twin's family systems are rotating-frame models at the drive frequency, so
+the carrier enters the response as the frame; a family that carries absolute
+transition frequencies would need the detuning, which is future record
+surface, not v1.
+"""
+function translate_drive(payload::WirePayload)
+    drives = Dict{Int,GenDrive}()
+    for (gen_ch, wave_idxs) in payload.port_plan
+        facts = payload.gen_cfg[gen_ch]
+        uI_all = Float64[]
+        uQ_all = Float64[]
+        carriers = Float64[]
+        for idx in wave_idxs
+            wave = payload.waves[idx]
+            # the Nyquist-zone band check (qick's freq2reg range contract)
+            f = wave.freq_MHz
+            fs = facts.f_dds_MHz
+            band = facts.nqz == 1 ? (0.0, fs / 2) : (fs / 2, fs)
+            (band[1] ≤ f ≤ band[2]) || error(
+                "translate_drive: wave $(repr(wave.name)) decodes to $f MHz but " *
+                "generator $gen_ch declares Nyquist zone $(facts.nqz) " *
+                "($(band[1])–$(band[2]) MHz) — the DDS code does not land in the " *
+                "declared zone",
+            )
+            push!(carriers, f)
+            g = wave.gain_code / facts.maxv
+            nsamp = wave.length_cycles * facts.samps_per_clk
+            if wave.outsel == "dds"
+                φ = deg2rad(wave.phase_deg)
+                append!(uI_all, fill(g * cos(φ), nsamp))
+                append!(uQ_all, fill(g * sin(φ), nsamp))
+            elseif wave.outsel == "zero"
+                append!(uI_all, zeros(nsamp))
+                append!(uQ_all, zeros(nsamp))
+            else
+                idata, qdata = _wave_segment(payload, gen_ch, wave)
+                φ = deg2rad(wave.phase_deg)
+                scale = 1.0 / facts.maxv
+                if wave.outsel == "input"
+                    append!(uI_all, g .* scale .* idata)
+                    append!(uQ_all, zeros(nsamp))
+                else   # "product": envelope x gain, the phase rotated in
+                    c, s = cos(φ), sin(φ)
+                    append!(uI_all, g .* scale .* (c .* idata .- s .* qdata))
+                    append!(uQ_all, g .* scale .* (s .* idata .+ c .* qdata))
+                end
+            end
+        end
+        isempty(uI_all) && error(
+            "translate_drive: generator $gen_ch has a port plan but no wave " *
+            "segments — the drive reconstruction produced nothing",
+        )
+        dt = 1.0 / facts.fs_hz
+        times = collect(0.0:dt:((length(uI_all)-1)*dt))
+        drives[gen_ch] = GenDrive(times, uI_all, uQ_all, carriers)
+    end
+    return drives
+end
+
 @testitem "the twin job server rides its own Piccolo+JSON extension" begin
     using Strumento
     if Base.identify_package("Piccolo") === nothing ||
@@ -575,5 +702,114 @@ end
             @test err isa ErrorException
             @test occursin(needle, sprint(showerror, err))
         end
+    end
+end
+
+@testitem "translate_drive reconstructs the analog drive from the wave table" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures", "_fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "soccfg_v2_testbench.json"))
+        golden = JSON.parsefile(joinpath(fixtures, "compiled_job_golden.json"))
+        nosweep = JSON.parsefile(joinpath(fixtures, "compiled_job_nosweep.json"))
+
+        # ── the golden: a zero-gain sweep start — the drive is identically zero
+        # (the wave-table assignment is the envelope-level truth), 1152 samples
+        # on the DAC grid (72 fabric cycles x 16 samples per cycle at fs 9.58464 GHz).
+        drive = ext.translate_drive(ext.read_payload(soccfg, golden))
+        @test length(drive) == 1
+        g0 = drive[0]
+        @test length(g0.times) == 1152
+        @test g0.times[2] - g0.times[1] ≈ 1 / 9.58464e9
+        @test all(iszero, g0.uI) && all(iszero, g0.uQ)
+
+        # ── the no-sweep variant: the calibration pi pulse at gain 8192 — a
+        # real drive. DAC-code normalization: (env/maxv) x (gain/maxv), so the
+        # gaussian peaks at 8192/32766 ≈ 0.25 of full scale, Q identically 0
+        # (the fixture's envelope is I-only), and the SHAPE follows the page.
+        drive_pi = ext.translate_drive(ext.read_payload(soccfg, nosweep))
+        gpi = drive_pi[0]
+        @test length(gpi.times) == 1152
+        peak = maximum(gpi.uI)
+        @test peak ≈ (32766 / 32766) * (8192 / 32766) atol = 1e-12
+        @test all(iszero, gpi.uQ)
+        # the page's own samples, scaled: the drive IS the envelope (product outsel)
+        payload = ext.read_payload(soccfg, nosweep)
+        page = payload.envelopes[0][1]
+        @test gpi.uI ≈ page.idata .* (8192 / 32766) / 32766
+        # the carrier is carried as the frame definition (validated, not applied:
+        # the v1 families are rotating-frame models — see the module docstring)
+        @test length(gpi.carriers_MHz) == 1
+        @test gpi.carriers_MHz[1] ≈ 4000.0 atol = 1e-3
+
+        # ── the carrier phase rotates the baseband: phase 90 deg on an I-only
+        # envelope moves the drive entirely into the Q quadrature.
+        rotated = deepcopy(nosweep)
+        w = Dict(rotated["program"]["waves"][1])
+        w["phase"] = round(Int, 2^32 / 4)          # 90 degrees in phase-register codes
+        rotated["program"]["waves"][1] = w
+        gro = ext.translate_drive(ext.read_payload(soccfg, rotated))[0]
+        @test all(x -> abs(x) < 1e-15, gro.uI)      # cos(π/2) residue only
+        @test gro.uQ ≈ gpi.uI
+
+        # ── outsel "dds" (the const-pulse path): no envelope — a constant drive
+        # at the gain, for the wave's length in fabric cycles.
+        dds = deepcopy(nosweep)
+        w = Dict(dds["program"]["waves"][1])
+        w["conf"] = 8 + 1                            # stdysel zero | oneshot | outsel dds
+        dds["program"]["waves"][1] = w
+        gdds = ext.translate_drive(ext.read_payload(soccfg, dds))[0]
+        @test length(gdds.times) == 1152
+        @test all(≈(8192 / 32766), gdds.uI)
+        @test all(iszero, gdds.uQ)
+
+        # ── multi-wave programs: the port plan concatenates the channel's
+        # waves in play order (the flat-top shape; inter-wave TIMING is the
+        # tProc's, the sequence is the wave table's).
+        two = deepcopy(nosweep)
+        push!(two["program"]["waves"], deepcopy(two["program"]["waves"][1]))
+        wport = findfirst(i -> get(i, "CMD", "") == "WPORT_WR", two["program"]["prog_list"])
+        inst = Dict(two["program"]["prog_list"][wport])
+        inst["ADDR"] = "&1"
+        push!(two["program"]["prog_list"], inst)
+        gtwo = ext.translate_drive(ext.read_payload(soccfg, two))[0]
+        @test length(gtwo.times) == 2304
+        @test gtwo.uI[1:1152] ≈ gpi.uI
+        @test gtwo.uI[1153:2304] ≈ gpi.uI
+
+        # ── a wave whose declared length outruns its envelope page is named.
+        overrun = deepcopy(nosweep)
+        w = Dict(overrun["program"]["waves"][1])
+        w["length"] = 200
+        overrun["program"]["waves"][1] = w
+        err = try
+            ext.translate_drive(ext.read_payload(soccfg, overrun));
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("3200", sprint(showerror, err))      # 200 cycles x 16 samples
+
+        # ── a frequency outside the declared Nyquist zone is refused.
+        oob = deepcopy(nosweep)
+        w = Dict(oob["program"]["waves"][1])
+        w["freq"] = round(Int, 0.9 * 2^32)                # ~8.6 GHz in zone 1
+        oob["program"]["waves"][1] = w
+        err = try
+            ext.translate_drive(ext.read_payload(soccfg, oob));
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("Nyquist", sprint(showerror, err))
     end
 end

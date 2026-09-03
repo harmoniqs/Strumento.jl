@@ -1041,3 +1041,88 @@ end
         end
     end
 end
+
+@testitem "the resonator sweep through the LIVE bridge: Python compile -> wire -> fit -> write-back (python-optional)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing ||
+       Base.identify_package("PythonCall") === nothing
+        @info "skipping: the bridge-driven chain needs Piccolo + JSON + PythonCall in this environment"
+        @test true
+    else
+        using PythonCall
+        ENV["PYTHONUTF8"] = "1"
+        st = try
+            pyimport("strumento")
+        catch e
+            @info "skipping: Python `strumento` not importable in this environment ($e)"
+            nothing
+        end
+        if st === nothing
+            @test true   # vacuous pass: the pure-Julia CI lane carries no Python strumento
+        else
+            using Piccolo
+            using JSON
+            using Strumento: DriftPlan, believed, advance!, OrnsteinUhlenbeck
+            ext = Base.get_extension(Strumento, :StrumentoBringupExt)
+            pext = Base.get_extension(Strumento, :StrumentoPythonCallExt)
+
+            fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+            record = joinpath(fixtures, "twins", "bosonic.md")
+            device = joinpath(fixtures, "multimode_rehearsal", "device.yaml")
+            soccfg = joinpath(fixtures, "multimode_rehearsal", "soccfg_v2_rehearsal.json")
+            wiring = TwinWiringMap([
+                TwinGenWiring(2, 1, 2; line = "qubit.drive"),
+                TwinGenWiring(3, 3, 4; line = "manipulate.main"),
+            ]; n_drives = 4)
+
+            plan = DriftPlan(:chi_kHz => [OrnsteinUhlenbeck(theta = 0.07, sigma = 3.0,
+                                                           mu = -298.4)])
+            rig = ext.RehearsalRig(record, device, soccfg, wiring;
+                                   drift = plan, seed = 0x1234,
+                                   overlay_id = "rehearsal-v2")
+            try
+                advance!(rig.twin, 2.0)
+                truth_chi = rig.twin.truth[:chi_kHz]
+                design = ext.ResonatorSweepDesign()
+
+                # the compile seam's LIVE lane: every schedule point compiled
+                # in-process through the bridge (the cqed pack's own factories
+                # + the core compile path), submitted over the wire — never
+                # Python-side execution
+                bridge = pext.BringupBridge(device; overlay_id = "rehearsal-v2")
+                jobs = (r, s) -> ext.point_jobs(
+                    f -> pext.compile_comb_point(bridge; ext.comb_geometry(design)...,
+                                                 f_kHz = f), r, s)
+                fitres = ext.run_resonator_sweep(rig, design; jobs = jobs)
+
+                # the recovery holds through the live-compiled payloads: the
+                # AGED truth, within the DERIVED tolerance
+                @test abs(fitres.chi_kHz - truth_chi) < fitres.chi_tolerance_kHz
+                @test fitres.provenance["evidence_class"] == "twin-rehearsal"
+
+                # the write-back landed in the belief
+                @test believed(rig.twin)["chi_kHz"] == fitres.chi_kHz
+                @test rig.twin.truth[:chi_kHz] == truth_chi
+
+                # the live payloads ARE the committed fixtures (the fixture
+                # lane and the bridge lane are one code path): the recovery
+                # through the fixtures matches within the fit's own
+                # resolution-scale — both lanes fit the same twin
+                rig2 = ext.RehearsalRig(record, device, soccfg, wiring;
+                                        drift = plan, seed = 0x1234,
+                                        overlay_id = "rehearsal-v2")
+                try
+                    advance!(rig2.twin, 2.0)
+                    fitres2 = ext.run_resonator_sweep(rig2, design)
+                    @test abs(fitres.chi_kHz - fitres2.chi_kHz) <
+                          3 * max(fitres.chi_sigma_kHz, fitres2.chi_sigma_kHz)
+                finally
+                    ext.stop!(rig2)
+                end
+            finally
+                ext.stop!(rig)
+            end
+        end
+    end
+end

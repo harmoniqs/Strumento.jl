@@ -2,6 +2,10 @@
 #
 # The real-board delegation soc lives here: `StrumentoSoc` hands a solved pulse
 # to the Python `strumento` framework over PythonCall (the option-(a) seam).
+# The bring-up compile bridge (issue #31, M4a) also lives here: `BringupBridge`
+# loads the committed demo-class device instance and compiles the cqed pack's
+# experiments to the `CompiledJob` wire form — Python never executes the job
+# (the payload crosses the wire to the twin job server, or to a real board).
 # The extension loads exactly when PythonCall is loaded; the base package
 # references no PythonCall name. Julia's extension semantics (1.12): extension
 # exports do NOT surface on the parent module — the soc contract verbs the
@@ -28,6 +32,189 @@ using TestItems
 using PythonCall
 
 export StrumentoSoc
+export BringupBridge
+
+# ──── BringupBridge — the bring-up compile surface (issue #31) ────────────────
+# The in-process Python bridge of the M4a rehearsal chain: the committed
+# demo-class DEVICE instance loaded through Python `strumento`, the cqed
+# pack's own pulse factories and the core compile path, and the `CompiledJob`
+# wire form out — one JSON-safe dict per requested measurement. Python never
+# EXECUTES anything: the payload crosses the wire to the twin job server
+# (or, pointed at a real transport, to a board) — the production shape from
+# day one.
+#
+# This extension's only trigger is PythonCall, so the bridge reaches the rig
+# surface (the Piccolo+JSON bring-up extension) LAZILY at runtime — the same
+# sibling-reach pattern the job server uses for TwinSoc. The geometry
+# parameters come from the CALLER (the bring-up procedure owns the design);
+# the envelope math goes through numpy so the bridge and the committed
+# fixture-generation script share one bit-identical code path.
+
+"""The v1 wire frame boundary, stated once: the twin's family systems are
+rotating-frame models at the drive frequency, so a payload's CARRIER is the
+frame (the twin's response is carrier-invariant) and the swept detuning must
+ride the ENVELOPE. The bridge's comb probe is exactly that — a shaped Ancilla
+probe whose Arb envelope rotates at the swept point frequency at a fixed
+carrier; a carrier-swept const probe (the stock spectroscopy experiments'
+swept axis) is frame-invisible to the v1 twin, and a frequency-stepped
+CloseLoop ladder is outside the server's v1 swept-amp form. See
+`compile_comb_point`."""
+const BRIDGE_FRAME_NOTE = "the v1 wire frame boundary (the carrier is the frame; the swept detuning rides the envelope)"
+
+"""
+    BringupBridge(device_path; overlay_id = "") -> BringupBridge
+
+The bring-up compile bridge: the committed demo-class device instance (a
+cqed pack instance with cavity modes — the multimode class) loaded
+in-process through Python `strumento`. `strumento` is imported lazily; an
+actionable error is raised if the Python package is unavailable. The bridge
+compiles requested measurements to the `CompiledJob` wire form:
+
+- `compile_comb_point(bridge; ...)` — the resonator-sweep procedure's
+  per-point comb job: the cavity displacement (the cqed pack's
+  alpha-calibrated `displace_alpha` mode-library factory) followed by the
+  shaped ancilla probe rotating at the point's frequency (see
+  `BRIDGE_FRAME_NOTE`).
+- `compile_cavity_point(bridge; ...)` — the stock
+  `strumento.packs.cqed.experiments.cavity_spectroscopy.CavitySpectroscopy`
+  experiment compiled at a fixed frequency: the seam's named target, the
+  same compile + wire path exercised on the pack's own cavity-probe
+  construction.
+
+Both are deterministic given the device and the geometry (verified across
+fresh processes; the committed fixture payloads in
+`test/fixtures/_fixtures/` are this bridge's output, regenerable by the
+committed `generate_rehearsal_payloads.py`).
+"""
+mutable struct BringupBridge
+    strumento::Py             # the imported `strumento` module
+    device::Py                # the loaded Device (Python)
+    overlay_id::String
+end
+
+function BringupBridge(device_path::AbstractString; overlay_id::AbstractString = "")
+    # Embedded-Python hygiene: a bare interpreter defaults to ASCII and
+    # chokes on the µ/– in device YAMLs — force UTF-8 before it starts.
+    ENV["PYTHONUTF8"] = "1"
+    st = try
+        pyimport("strumento")
+    catch e
+        error("BringupBridge requires the Python `strumento` package (the " *
+              "reference bring-up env; see test/fixtures/_fixtures/" *
+              "generate_rehearsal_payloads.py). `pyimport(\"strumento\")` " *
+              "failed: $e")
+    end
+    isfile(device_path) || error(
+        "BringupBridge: the device instance $device_path does not exist — the " *
+        "bridge loads committed fixtures (the rig carries the path)")
+    dev = try
+        st.Device.load(string(device_path))
+    catch e
+        error("BringupBridge: Device.load($(device_path)) failed: $e")
+    end
+    return BringupBridge(st, dev, String(overlay_id))
+end
+
+# the JSON-safe hop: a Py object -> a canonical JSON string -> a Julia Dict.
+# `json.dumps` on the Python side and `JSON.parse` on this side agree on
+# primitives by construction (the D14 payload is JSON-safe all the way down).
+# JSON.jl is a weakdep of Strumento; it is loaded on demand here (PythonCall
+# is this extension's only trigger) and errors actionably when absent.
+function _py_to_julia_dict(obj::Py)
+    Base.identify_package("JSON") === nothing && error(
+        "BringupBridge: JSON.jl is not in this environment — the CompiledJob " *
+        "wire form is JSON by the D14 contract (add JSON and load it)")
+    JSONjl = Base.require(Base.identify_package("JSON"))
+    json = pyimport("json")
+    return JSONjl.parse(pyconvert(String, json.dumps(obj)))
+end
+
+"""
+    compile_comb_point(bridge; f_kHz, displacement_alpha, T_disp_us, T_spec_us,
+                       probe_gain, qubit_freq_mhz, reps, soft_avgs = 1) -> Dict
+
+Compile the resonator sweep's per-point comb job (the `CompiledJob` wire
+form): the cavity displacement to `|beta| = displacement_alpha` (the cqed
+pack's alpha-calibrated mode-library factory, calibration-fed) followed by
+the shaped ancilla π-pulse (`probe_gain` = the peak drive fraction, the
+shaped flip angle π) whose Arb envelope rotates at `f_kHz` — the swept
+detuning riding the envelope, the v1 frame boundary (`BRIDGE_FRAME_NOTE`).
+
+The geometry parameters come from the caller (the bring-up procedure owns
+the design); the envelope math goes through numpy — the same code path as
+the committed fixture-generation script, so the bridge's output and the
+committed fixtures are bit-identical.
+"""
+function compile_comb_point(bridge::BringupBridge;
+                            f_kHz,
+                            displacement_alpha,
+                            T_disp_us,
+                            T_spec_us,
+                            probe_gain,
+                            qubit_freq_mhz,
+                            reps::Integer,
+                            soft_avgs::Integer = 1)
+    np = pyimport("numpy")
+    pulses = pyimport("strumento.core.pulses")
+    LineRef = pyimport("strumento.core.wiring").LineRef
+    StrumentoProgram = pyimport("strumento.core.program").StrumentoProgram
+
+    dev = bridge.device
+    fs = pyconvert(Float64, dev.soccfg_snapshot["gens"][3]["fs"])
+    disp = dev.manipulate.displace_alpha(pyconvert(Py, displacement_alpha))
+    n0 = pyconvert(Py, Int(round(T_disp_us * fs)))
+    n1 = pyconvert(Py, Int(round(T_spec_us * fs)))
+    t = np.arange(n1) / fs
+    env = np.sin(np.pi * t / T_spec_us)^2 * np.exp(2im * np.pi * (f_kHz / 1000.0) * t)
+    idata = np.concatenate((np.zeros(n0), np.real(env)))
+    qdata = np.concatenate((np.zeros(n0), np.imag(env)))
+    peak = max(1.0, pyconvert(Float64, np.max(np.hypot(idata, qdata))))
+    probe = pulses.Pulse(
+        line = LineRef("qubit", "drive"), freq_mhz = qubit_freq_mhz,
+        gain = probe_gain,
+        envelope = pulses.Arb(idata = (idata / peak).tolist(),
+                              qdata = (qdata / peak).tolist()),
+        label = "comb_probe",
+    )
+    seq = pulses.Seq().play(disp).play(probe).measure()
+    prog = StrumentoProgram(dev; seq = seq, reps = pyconvert(Py, Int(reps)))
+    job = prog.to_compiled_job(overlay_id = bridge.overlay_id,
+                               soft_avgs = pyconvert(Py, Int(soft_avgs)))
+    return _py_to_julia_dict(job.to_wire())
+end
+
+"""
+    compile_cavity_point(bridge; freq_mhz, reps, soft_avgs = 1) -> Dict
+
+Compile the stock cqed `CavitySpectroscopy` experiment at a FIXED frequency
+(the `CompiledJob` wire form): the seam's named target through the pack's own
+sequence construction — its probe pulse (the cavity mode's line, the
+experiment's probe gain, a `Const` envelope) and its `Measure` op, compiled
+by the same `StrumentoProgram` path. No sweep: the experiment's swept
+frequency axis is the stock form's carrier sweep — frame-invisible to the v1
+twin (`BRIDGE_FRAME_NOTE`) and outside the server's v1 ladder form — so the
+seam-target job runs at one point, and the RESPONSE through the twin's
+ancilla marginal is the honest flat physics (cavity transmission is not a
+v1-twin observable; the resonator sweep's dispersive signature rides the
+comb).
+"""
+function compile_cavity_point(bridge::BringupBridge;
+                              freq_mhz,
+                              reps::Integer,
+                              soft_avgs::Integer = 1)
+    CavitySpectroscopy = pyimport(
+        "strumento.packs.cqed.experiments.cavity_spectroscopy").CavitySpectroscopy
+    StrumentoProgram = pyimport("strumento.core.program").StrumentoProgram
+
+    exp = CavitySpectroscopy(bridge.device, freqs = pyconvert(Py, freq_mhz), points = 1)
+    seq, _ = exp.sequence()
+    axes = exp.axes()
+    prog = StrumentoProgram(bridge.device; seq = seq, axes = axes,
+                            reps = pyconvert(Py, Int(reps)))
+    job = prog.to_compiled_job(overlay_id = bridge.overlay_id,
+                               soft_avgs = pyconvert(Py, Int(soft_avgs)))
+    return _py_to_julia_dict(job.to_wire())
+end
 
 # ──── StrumentoSoc ───────────────────────────────────────────────────────────
 # The real-board path, delegating to the Python `strumento` package over
@@ -243,6 +430,131 @@ end
             # knot 1 (t=0) is refused loudly on the delegated path
             @test_throws ErrorException execute!(soc, pulse, cmap, [1])
         end
+    end
+end
+
+# ──── BringupBridge testitems (issue #31) ─────────────────────────────────────
+# Python-optional (the established precedent): the items guard on PythonCall
+# in the environment AND the Python `strumento` package being importable,
+# skipping cleanly otherwise — the pure-Julia CI lane carries no Python
+# strumento, and the Julia-only bring-up coverage rides the committed
+# fixture payloads through the same procedure code path.
+
+@testitem "BringupBridge compiles the comb point in-process (python-optional)" begin
+    using Strumento
+    if Base.identify_package("PythonCall") === nothing
+        @info "skipping: no PythonCall in this environment (PythonCall-extension surface)"
+        @test true
+    else
+        using PythonCall
+        BringupBridge = Base.get_extension(Strumento, :StrumentoPythonCallExt).BringupBridge
+        ENV["PYTHONUTF8"] = "1"
+        st = try
+            pyimport("strumento")
+        catch e
+            @info "skipping: Python `strumento` not importable in this environment ($e)"
+            nothing
+        end
+        if st === nothing
+            @test true   # vacuous pass: the pure-Julia CI lane carries no Python strumento
+        else
+            fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+            bridge = BringupBridge(joinpath(fixtures, "multimode_rehearsal", "device.yaml");
+                                   overlay_id = "rehearsal-v2")
+
+            # the geometry of the committed design (the fixture script's constants)
+            kwargs = (f_kHz = 298.4, displacement_alpha = sqrt(2.0), T_disp_us = 4.0,
+                      T_spec_us = 10.0, probe_gain = 2π / 10000.0,
+                      qubit_freq_mhz = 4.0, reps = 50, soft_avgs = 1)
+            job = Base.get_extension(Strumento, :StrumentoPythonCallExt).compile_comb_point(
+                bridge; kwargs...)
+
+            # the payload is the D14 wire form: overlay_id + program + acquire,
+            # the program carrying qick's own dump_prog keys
+            @test sort!(collect(keys(job))) == ["acquire", "overlay_id", "program"]
+            @test job["overlay_id"] == "rehearsal-v2"
+            for key in ("envelopes", "gen_chs", "ro_chs", "waves", "prog_list",
+                        "loop_dims", "avg_level")
+                @test haskey(job["program"], key)
+            end
+            @test job["acquire"]["reps"] == 50
+            @test job["acquire"]["expts"] === nothing      # per-point jobs: no sweep
+            @test job["acquire"]["reads_per_shot"] == [1]
+            # the two played generators: the qubit line (2) and the manipulate
+            # cavity line (3) — the wiring map's channels
+            @test sort([parse(Int, k) for k in keys(job["program"]["gen_chs"])]) == [2, 3]
+
+            # in-process determinism: the identical compile is bit-identical
+            # (the replay contract's compile half; `==`, within-process)
+            again = Base.get_extension(Strumento, :StrumentoPythonCallExt).compile_comb_point(
+                bridge; kwargs...)
+            @test again == job
+
+            # the bridge reproduces the COMMITTED fixture bit-exactly (the
+            # fixture-generation script and this bridge share one numpy code
+            # path; a strumento/qick upgrade that shifts a register code fails
+            # here loudly = regenerate the fixtures)
+            using JSON
+            fixture = JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                              "comb_rehearsal_04.json"))
+            at290 = Base.get_extension(Strumento, :StrumentoPythonCallExt).compile_comb_point(
+                bridge; kwargs..., f_kHz = 290.0)
+            @test at290 == fixture
+        end
+    end
+end
+
+@testitem "BringupBridge compiles the stock cqed cavity-spectroscopy experiment (python-optional)" begin
+    using Strumento
+    if Base.identify_package("PythonCall") === nothing
+        @info "skipping: no PythonCall in this environment (PythonCall-extension surface)"
+        @test true
+    else
+        using PythonCall
+        pext = Base.get_extension(Strumento, :StrumentoPythonCallExt)
+        ENV["PYTHONUTF8"] = "1"
+        st = try
+            pyimport("strumento")
+        catch e
+            @info "skipping: Python `strumento` not importable in this environment ($e)"
+            nothing
+        end
+        if st === nothing
+            @test true
+        else
+            fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+            bridge = pext.BringupBridge(joinpath(fixtures, "multimode_rehearsal", "device.yaml");
+                                        overlay_id = "rehearsal-v2")
+            job = pext.compile_cavity_point(bridge; freq_mhz = 5.0, reps = 50, soft_avgs = 1)
+
+            # the seam's named target compiled through the pack's own sequence:
+            # ONE played generator (the manipulate cavity line, gen 3), no
+            # sweep axis (the fixed-frequency form — see the docstring)
+            @test job["overlay_id"] == "rehearsal-v2"
+            @test [parse(Int, k) for k in keys(job["program"]["gen_chs"])] == [3]
+            @test job["acquire"]["expts"] === nothing
+            @test job["acquire"]["reads_per_shot"] == [1]
+
+            # and it reproduces the committed fixture bit-exactly
+            using JSON
+            fixture = JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                               "cavity_rehearsal.json"))
+            @test job == fixture
+        end
+    end
+end
+
+@testitem "BringupBridge placement: the PythonCall extension; base gains nothing" begin
+    using Strumento
+    # UNguarded (the placement pin must hold in EVERY configuration).
+    @test !isdefined(Strumento, :BringupBridge)
+    if Base.identify_package("PythonCall") === nothing
+        @info "skipping the extension side: no PythonCall in this environment"
+        @test true
+    else
+        ext = Base.get_extension(Strumento, :StrumentoPythonCallExt)
+        @test ext !== nothing
+        @test isdefined(ext, :BringupBridge)
     end
 end
 

@@ -21,6 +21,7 @@ Piccolo = "c4671d76-df94-11ed-2057-43d4fd632fad"  # physics trigger: mock rollou
 PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"  # bridge trigger: the Python delegation soc
 
 [extensions]
+StrumentoBringupExt = ["Piccolo", "JSON"]  # the rehearsal rig + bring-up procedure layer (issue #31)
 StrumentoJobServerExt = ["Piccolo", "JSON"]  # TwinJobServer: the D14 wire contract (issue #29)
 StrumentoPiccoloExt = "Piccolo"      # MockSoc + the AbstractPulse translation/seam methods
 StrumentoPythonCallExt = "PythonCall"  # StrumentoSoc (the Python `strumento` delegation path)

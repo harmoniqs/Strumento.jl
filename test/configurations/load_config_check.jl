@@ -73,8 +73,9 @@ const BASE_SURFACE = [
     # the soc contract
     :AbstractSoc, :execute!, :load_envelope!, :play_program!, :acquire,
     :dac_rate, :adc_rate,
-    # the channel map (device policy)
+    # the channel map (device policy) + the twin wiring (the bring-up rung, issue #31)
     :QickChannelMap, :QickGenChannel,
+    :TwinWiringMap, :TwinGenWiring, :wiring_for,
     # the translation data contract + the duck-typed verb
     :QickProgram, :pulse_to_envelopes,
     # readout conversion

@@ -649,7 +649,7 @@ _twinsoc_type() = begin
 end
 
 """
-    TwinJobServer(soc, soccfg; overlay_id="", overlays=(), dt=0.0)
+    TwinJobServer(soc, soccfg; overlay_id="", overlays=(), dt=0.0, wiring=nothing)
 
 A board-shaped job server fronting one `TwinSoc` (the twin face: family
 system from the twin's truth, the record's readout confusion, binomial shot
@@ -663,6 +663,13 @@ actor that serves many jobs against one twin, and the drift advances ACROSS
 jobs — job *k* measures truth aged `(k-1)·dt`. Construct the soc with its own
 per-acquire `dt = 0` and let the server own the clock.
 
+`wiring` (a `TwinWiringMap`, issue #31) makes the DEVICE-channel → twin-drive
+routing DECLARED instead of positional: each payload's played generator
+channel must be wired in the map, and its envelope lands on exactly the twin
+drive pair the map declares. The default `nothing` keeps the v1 positional
+routing (the k-th played generator, in sorted channel order, drives twin
+controls `2k−1`/`2k`) — the bare-server behavior the D14 testitems pin.
+
 Execution (see `execute_job`): read → translate → the soc's own
 load/play/acquire path (the same seeded-response machinery, drift included)
 → the `RawAcquisition` wire form.
@@ -673,6 +680,7 @@ mutable struct TwinJobServer
     overlay_id::String
     overlays::Tuple{Vararg{String}}
     dt::Float64
+    wiring::Union{Nothing,Strumento.TwinWiringMap}   # declared routing (issue #31)
     jobs::Dict{String,Dict{String,Any}}   # job id => its record (status + payload)
     queue::Vector{String}                 # pending ids, FIFO — one worker owns the board
     n::Int                                # the next job id
@@ -681,7 +689,8 @@ end
 function TwinJobServer(soc, soccfg::AbstractDict;
                        overlay_id::AbstractString = "",
                        overlays::Tuple{Vararg{String}} = (),
-                       dt::Real = 0.0)
+                       dt::Real = 0.0,
+                       wiring::Union{Nothing,Strumento.TwinWiringMap} = nothing)
     TwinSocT = _twinsoc_type()
     soc isa TwinSocT || error(
         "TwinJobServer: the soc must be a TwinSoc (got $(typeof(soc))) — the " *
@@ -689,7 +698,30 @@ function TwinJobServer(soc, soccfg::AbstractDict;
     dt ≥ 0 || error(
         "TwinJobServer: dt must be ≥ 0 — twin-time only runs forward (got $dt)")
     return TwinJobServer(soc, soccfg, String(overlay_id), overlays, Float64(dt),
-                         Dict{String,Dict{String,Any}}(), String[], 0)
+                         wiring, Dict{String,Dict{String,Any}}(), String[], 0)
+end
+
+# The per-payload routing: which twin drive controls each played generator's
+# I/Q envelopes feed. With a `TwinWiringMap`, the DECLARED wiring (every played
+# gen must be wired — an unmapped device line is a refused job, not a guess);
+# without one, the v1 positional routing (k-th sorted played gen → 2k−1/2k).
+function _payload_routing(server::TwinJobServer, gen_chs::Vector{Int})
+    if server.wiring === nothing
+        return Tuple{Int,Int,Union{Int,Nothing}}[(gen_ch, 2k - 1, 2k)
+                for (k, gen_ch) in enumerate(gen_chs)], 2 * length(gen_chs)
+    end
+    wiring = server.wiring
+    routing = Tuple{Int,Int,Union{Int,Nothing}}[]
+    for gen_ch in gen_chs
+        w = Strumento.wiring_for(wiring, gen_ch)
+        w === nothing && error(
+            "execute_job: the payload plays generator channel $gen_ch, which the " *
+            "board's wiring does not map to any twin drive (wired: " *
+            "$(join(["$(x.gen_ch) -> ($(x.i_drive), $(x.q_drive))" for x in wiring.wirings], ", "))) — " *
+            "an unmapped device line is a refused job, not a guess")
+        push!(routing, (gen_ch, w.i_drive, w.q_drive))
+    end
+    return routing, wiring.n_drives
 end
 
 # The overlay personality (D25: one overlay ⇔ one snapshot). "" means whatever
@@ -783,16 +815,15 @@ function execute_job(server::TwinJobServer, job_wire::AbstractDict)
             times = [1e9 * (i - 1) / payload.gen_cfg[gen_chs[1]].fs_hz for i in 1:nsamp]
             envelopes = Dict{Int,Tuple{Vector{Float64},Vector{Float64}}}()
             carriers = Dict{Int,Float64}()
-            routing = Tuple{Int,Int,Union{Int,Nothing}}[]
-            for (k, gen_ch) in enumerate(gen_chs)
+            routing, n_drives = _payload_routing(server, gen_chs)
+            for gen_ch in gen_chs
                 d = drives[gen_ch]
                 pad = zeros(nsamp - length(d.times))
                 envelopes[gen_ch] = (vcat(d.uI, pad), vcat(d.uQ, pad))
                 carriers[gen_ch] = isempty(d.carriers_MHz) ? 0.0 : d.carriers_MHz[end]
-                push!(routing, (gen_ch, 2k - 1, 2k))
             end
             program = QickProgram(times, envelopes, carriers, routing,
-                                   2 * length(gen_chs), [nsamp])
+                                   n_drives, [nsamp])
             for (gen_ch, (uI, uQ)) in envelopes
                 load_envelope!(soc, gen_ch, uI, uQ)
             end
@@ -1655,5 +1686,81 @@ end
         @test r1 != r3                    # different seeds → different draws
         @test JSON.parse(r1) == JSON.parse(r2)   # ...and it is the wire form, parseable
         rm(script; force = true)
+    end
+end
+
+@testitem "declared wiring: the TwinWiringMap routes each played gen onto its twin drives (issue #31)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        using LinearAlgebra
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        pc = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        using Strumento: DriftPlan, instantiate
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "multimode_rehearsal",
+                                         "soccfg_v2_rehearsal.json"))
+        comb = JSON.parsefile(joinpath(fixtures, "_fixtures", "comb_rehearsal_04.json"))
+        bosonic = joinpath(fixtures, "twins", "bosonic.md")
+
+        # the bosonic twin (4 family drives: transmon I/Q, cavity I/Q) — the
+        # rig's own fixture set, exercised at the SERVER level here.
+        twin = instantiate(bosonic; drift = DriftPlan(), seed = 0xC0FFEE)
+        builder = pc.bosonic_system_builder(twin.record)
+        meas = pc.bosonic_ancilla_populations(2, 12)
+        ψ = zeros(ComplexF64, 24); ψ[1] = 1.0
+        soc = pc.TwinSoc(twin, ψ, ψ; families = Dict("bosonic" => builder),
+                        measurement_fn = meas, shots = 512, exact = true,
+                        dac_rate = 0.0125)
+
+        # ── the default (no wiring): the v1 positional routing — the field
+        # says so, and the D14 pins cover the behavior.
+        server = ext.TwinJobServer(soc, soccfg; overlay_id = "rehearsal-v2")
+        @test server.wiring === nothing
+
+        # ── declared wiring: the canonical rig map (gen 2 -> ancilla drives,
+        # gen 3 -> cavity drives). The comb payload plays gens {2, 3} — for
+        # this payload the declared routing agrees with the positional one,
+        # so the responses match.
+        canonical = Strumento.TwinWiringMap(
+            [Strumento.TwinGenWiring(2, 1, 2; line = "qubit.drive"),
+             Strumento.TwinGenWiring(3, 3, 4; line = "manipulate.main")]; n_drives = 4)
+        server_c = ext.TwinJobServer(soc, soccfg; overlay_id = "rehearsal-v2",
+                                     wiring = canonical)
+        @test ext._payload_routing(server_c, [2, 3]) == (([(2, 1, 2), (3, 3, 4)]), 4)
+        @test ext.execute_job(server_c, deepcopy(comb)) == ext.execute_job(server, deepcopy(comb))
+
+        # ── the wiring is REAL, not decorative: a swapped map (gen 2 -> cavity
+        # drives, gen 3 -> ancilla drives) routes the displacement onto the
+        # ancilla and the probe onto the cavity — a different response.
+        swapped = Strumento.TwinWiringMap(
+            [Strumento.TwinGenWiring(2, 3, 4; line = "manipulate.main"),
+             Strumento.TwinGenWiring(3, 1, 2; line = "qubit.drive")]; n_drives = 4)
+        server_s = ext.TwinJobServer(soc, soccfg; overlay_id = "rehearsal-v2",
+                                    wiring = swapped)
+        @test ext._payload_routing(server_s, [2, 3]) == (([(2, 3, 4), (3, 1, 2)]), 4)
+        @test ext.execute_job(server_s, deepcopy(comb)) != ext.execute_job(server_c, deepcopy(comb))
+
+        # ── an unmapped played gen is a refused job, named actionably: a map
+        # wiring only the qubit channel leaves gen 3 (the cavity line) unmapped.
+        partial = Strumento.TwinWiringMap(
+            [Strumento.TwinGenWiring(2, 1, 2; line = "qubit.drive")]; n_drives = 4)
+        server_p = ext.TwinJobServer(soc, soccfg; overlay_id = "rehearsal-v2",
+                                      wiring = partial)
+        err = try
+            ext.execute_job(server_p, deepcopy(comb)); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        msg = sprint(showerror, err)
+        @test occursin("generator channel 3", msg)
+        @test occursin("does not map", msg)
+        @test occursin("2 -> (1, 2)", msg)         # the wired set, listed
     end
 end

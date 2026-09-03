@@ -26,13 +26,16 @@
 module StrumentoPythonCallExt
 
 import Strumento
-import Strumento: AbstractSoc, execute!, dac_rate, adc_rate, QickChannelMap
+import Strumento: AbstractSoc, execute!, dac_rate, adc_rate, QickChannelMap,
+    DCAxisMap, DCAxis, gate_names,          # the DC data surface (issue #35)
+    set_gate!, get_gate, gate_snapshot      # the DC control-class verbs (issue #35)
 using TestItems
 
 using PythonCall
 
 export StrumentoSoc
 export BringupBridge
+export StrumentoDCSource
 
 # ──── BringupBridge — the bring-up compile surface (issue #31) ────────────────
 # The in-process Python bridge of the M4a rehearsal chain: the committed
@@ -650,6 +653,159 @@ end
         ext = Base.get_extension(Strumento, :StrumentoPythonCallExt)
         @test ext !== nothing
         @test isdefined(ext, :BringupBridge)
+    end
+end
+
+# ──── The dc.py bridge (issue #35, M4b-1) ───────────────────────────────────────
+# The DC verbs' mapping onto the landed Python seam: strumento.core.dc's
+# DCSource (named-axis DC control over a VoltageSource driver, with max_v
+# clamping — the spin-qubit electrostatics seam). The bridge carries the
+# instrument-side facts as a Julia DCAxisMap (base's DC data surface) and
+# delegates every verb 1:1 to the landed public surface — Python owns
+# clamping and axis addressing, Julia owns the contract. Python-optional per
+# the established precedent: the items skip cleanly without the reference env.
+
+"""
+    StrumentoDCSource(axes::DCAxisMap; source = nothing) -> StrumentoDCSource
+
+The dc.py bridge: the Julia DC control-class face of the landed Python seam
+`strumento.core.dc.DCSource`. `axes` is base's instrument-side `DCAxisMap`
+(gate name → voltage-source channel + the hard safety clamp); it builds the
+Python `DCAxis` set, and `source` is a Python `VoltageSource` driver — the
+landed seam's own `MockVoltageSource` by default (offline work; labs wrap
+their instrument per the seam's Protocol).
+
+The verbs delegate 1:1: `set_gate!` → `DCSource.set` (the |v| ≤ max_v clamp
+fires through the seam — Python owns instrument safety), `get_gate` →
+`DCSource.get`, `gate_snapshot` → `DCSource.snapshot`. An unknown gate's
+KeyError and a clamp's ValueError surface as actionable Julia errors with
+the seam's own message riding through. `strumento` is imported lazily, so
+loading this extension never initializes the interpreter.
+"""
+mutable struct StrumentoDCSource
+    dc::Py             # the Python strumento.core.dc.DCSource (named-axis wrapper)
+    axes::DCAxisMap    # the Julia-side instrument facts (the bridge's input)
+end
+
+function StrumentoDCSource(axes::DCAxisMap; source = nothing)
+    st = try
+        pyimport("strumento")
+    catch e
+        error("StrumentoDCSource requires the Python `strumento` package (the " *
+              "landed DC seam, strumento.core.dc). `pyimport(\"strumento\")` " *
+              "failed: $e")
+    end
+    dc = pyimport("strumento.core.dc")
+    src = source === nothing ? dc.MockVoltageSource() : source
+    pyaxes = pydict([name => dc.DCAxis(channel = ax.channel, max_v = ax.max_v)
+                     for (name, ax) in axes.axes])
+    return StrumentoDCSource(dc.DCSource(src, pyaxes), axes)
+end
+
+# Re-raise a Python-seam failure as an actionable Julia error with the seam's
+# own message riding through (the landed surface owns the wording: the
+# unknown-axis list, the clamp's bound).
+function _pyseam_error(what::AbstractString, e)
+    return error("StrumentoDCSource: $what failed through the Python DC seam: " *
+                 sprint(showerror, e))
+end
+
+function set_gate!(bridge::StrumentoDCSource, gate::AbstractString, volts::Real)
+    try
+        bridge.dc.set(gate, Float64(volts))
+    catch e
+        _pyseam_error("set_gate!($(repr(gate)), $volts V)", e)
+    end
+    return bridge
+end
+
+function get_gate(bridge::StrumentoDCSource, gate::AbstractString)
+    try
+        return pyconvert(Float64, bridge.dc.get(gate))
+    catch e
+        _pyseam_error("get_gate($(repr(gate)))", e)
+    end
+end
+
+function gate_snapshot(bridge::StrumentoDCSource)
+    return pyconvert(Dict{String,Float64}, bridge.dc.snapshot())
+end
+
+@testitem "the dc.py bridge delegates the DC verbs to the landed Python seam (python-optional)" begin
+    using Strumento
+    if Base.identify_package("PythonCall") === nothing
+        @info "skipping: no PythonCall in this environment (PythonCall-extension surface)"
+        @test true
+    else
+        using PythonCall
+        ENV["PYTHONUTF8"] = "1"
+        st = try
+            pyimport("strumento")
+        catch e
+            @info "skipping: Python `strumento` not importable in this environment ($e)"
+            nothing
+        end
+        if st === nothing
+            @test true   # vacuous pass: the pure-Julia CI lane carries no Python strumento
+        else
+            StrumentoDCSource =
+                Base.get_extension(Strumento, :StrumentoPythonCallExt).StrumentoDCSource
+
+            # the bridge is built from the instrument-side data surface and
+            # defaults to the landed seam's own MockVoltageSource
+            axes = DCAxisMap("L" => DCAxis(0, 1.0), "R" => DCAxis(1, 0.5))
+            bridge = StrumentoDCSource(axes)
+
+            # set/get round-trip through the Python DCSource
+            @test set_gate!(bridge, "L", 0.25) === bridge
+            @test get_gate(bridge, "L") == 0.25
+            set_gate!(bridge, "R", -0.1)
+            @test get_gate(bridge, "R") == -0.1
+            @test gate_snapshot(bridge) == Dict("L" => 0.25, "R" => -0.1)
+
+            # an unwritten axis reads the source's 0.0 default (the seam's own)
+            fresh = StrumentoDCSource(axes)
+            @test get_gate(fresh, "L") == 0.0
+
+            # the unknown axis is named actionably, the Python seam's message riding
+            err = try
+                set_gate!(bridge, "barrier", 0.1); nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            msg = sprint(showerror, err)
+            @test occursin("barrier", msg)
+            @test occursin("unknown DC axis", msg)
+
+            # the safety clamp fires THROUGH the seam (dc.py owns |v| ≤ max_v)
+            err = try
+                set_gate!(bridge, "L", 1.5); nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("max_v", sprint(showerror, err))
+
+            # the landed seam's own state records the delegated writes (the
+            # MockVoltageSource history — the bridge adds no bookkeeping of its own)
+            hist = pyconvert(Vector{Tuple{Int,Float64}}, bridge.dc.source.history)
+            @test (0, 0.25) in hist && (1, -0.1) in hist
+        end
+    end
+end
+
+@testitem "the dc.py bridge placement: the PythonCall extension; base gains nothing" begin
+    using Strumento
+    # UNguarded (the placement pin must hold in EVERY configuration).
+    @test !isdefined(Strumento, :StrumentoDCSource)
+    if Base.identify_package("PythonCall") === nothing
+        @info "skipping the extension side: no PythonCall in this environment"
+        @test true
+    else
+        ext = Base.get_extension(Strumento, :StrumentoPythonCallExt)
+        @test ext !== nothing
+        @test isdefined(ext, :StrumentoDCSource)
     end
 end
 

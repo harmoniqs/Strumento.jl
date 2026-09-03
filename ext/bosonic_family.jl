@@ -83,10 +83,21 @@ rotating frame with linear quadrature drives.
 | `chi_p_kHz`       | higher-order dispersive χ′/2π  | `χ′ = 2π · v · 1e-6`           |
 | `T1_q_us` (noise)  | transmon T1 (μs)               | `γ₁ = 1e-3 / v` [ns⁻¹]         |
 | `kappa_c_per_us` (noise) | cavity κ (per μs)        | `κ_c = v · 1e-3` [ns⁻¹]        |
+| `detuning_kHz` (OPTIONAL truth key; NOT a record field) | the ancilla
+  transition's offset from the drive frame (kHz) | `Δ = 2π · v · 1e-6`, as `Δ·n̂_q` |
 
 Both Kerrs enter in the ladder convention `E_n = ωn + (α/2)n(n−1)` (the skill's
 `−K_q q†²q²` form with `K_q = −α_q/2`): the record's `K_q_GHz` is the signed
 ANHARMONICITY (negative for a transmon), not the positive self-Kerr symbol.
+
+`detuning_kHz` (issue #37) is an OPTIONAL truth key the record does NOT carry:
+the record's frame is nominal (the bare ancilla transition is absorbed into
+the rotating frame), so the default is 0 — the frame is exact. A twin whose
+truth carries it (the hidden-truth discipline: seeded into truth directly, a
+Hamiltonian parameter like any other) offsets every ancilla transition by Δ —
+the Ramsey procedure's observable — and drift can move it once the key exists
+in truth (DriftPlan's `haskey` skip). It is HAMILTONIAN truth (driftable), not
+decay noise: the static-from-record T1/κ contract is untouched.
 
 # Level-count conventions
 
@@ -123,6 +134,9 @@ function bosonic_system_builder(record::Strumento.TwinRecord)
         α_q = 2π * _bosonic_truth(truth, :K_q_GHz)
         α_c = 2π * _bosonic_truth(truth, :K_c_kHz) * 1e-6
         χ_p = 2π * _bosonic_truth(truth, :chi_p_kHz) * 1e-6
+        # the OPTIONAL detuning truth key (issue #37): absent → 0, the nominal
+        # frame (the record carries no detuning parameter — see the unit table)
+        Δ  = 2π * get(truth, :detuning_kHz, 0.0) * 1e-6
         n_t = _bosonic_dim(truth, :N_transmon, 2)
         n_f = _bosonic_dim(truth, :N_fock, 1)
 
@@ -131,9 +145,11 @@ function bosonic_system_builder(record::Strumento.TwinRecord)
         q = kron(Matrix{ComplexF64}(I, n_f, n_f), annihilate(n_t))   # transmon mode
         na, nq = a'a, q'q
 
-        # Rotating-frame dispersive Hamiltonian (see the unit table above).
+        # Rotating-frame dispersive Hamiltonian (see the unit table above):
+        # the detuning term Δ·n̂_q offsets every ancilla transition from the
+        # drive frame (zero — the nominal frame — when the truth carries none).
         H_drift = χ * na * nq + (α_c / 2) * (a'^2 * a^2) +
-                  (α_q / 2) * (q'^2 * q^2) + χ_p * (a'^2 * a^2) * nq
+                  (α_q / 2) * (q'^2 * q^2) + χ_p * (a'^2 * a^2) * nq + Δ * nq
 
         # Linear quadrature drives: transmon I/Q then cavity I/Q. Bounds are
         # unit-symmetric placeholders — the record carries no drive bound and
@@ -328,6 +344,31 @@ end
         @test D[2][idx(1, 1), idx(1, 2)] ≈ -0.5im           # transmon Q: i(q†−q)/2
         @test D[3][idx(1, 1), idx(2, 1)] ≈ 0.5              # cavity I: (a+a†)/2
         @test D[4][idx(1, 1), idx(2, 1)] ≈ -0.5im           # cavity Q: i(a†−a)/2
+
+        # ── the OPTIONAL detuning truth key (issue #37): the ancilla
+        # transition's offset from the drive frame, a Hamiltonian term —
+        # Δ·n̂_q at the record's kHz convention (2π·v·1e-6 rad·GHz). The
+        # record's frame is nominal (no detuning parameter: the bare
+        # transition is absorbed in the frame), so the key defaults to 0 when
+        # the truth does not carry it; a twin whose truth carries it (the
+        # hidden-truth discipline, seeded post-instantiate) fringes in Ramsey
+        # and shifts every ancilla transition by Δ — the calibration-set
+        # slice's observable.
+        @test !haskey(twin.truth, :detuning_kHz)           # the record carries none
+        builder = ext.bosonic_system_builder(twin.record)
+        sys_det = builder(merge(twin.truth, Dict(:detuning_kHz => 20.0)))
+        Hd = sys_det.H_drift
+        Δ = 2π * 20.0 * 1e-6
+        @test norm(Matrix(Hd) - diagm(diag(Hd))) < 1e-15    # still diagonal
+        # the |e,n⟩ diagonal shifts by Δ for every photon number n; the
+        # |g,n⟩ diagonals are untouched (the offset rides n̂_q)
+        for n in 1:12
+            @test Hd[idx(n, 2), idx(n, 2)] ≈ H[idx(n, 2), idx(n, 2)] + Δ
+            @test Hd[idx(n, 1), idx(n, 1)] ≈ H[idx(n, 1), idx(n, 1)] atol = 1e-15
+        end
+        # absent from the truth, the frame is exact (the default)
+        @test builder(twin.truth).H_drift[idx(1, 2), idx(1, 2)] ==
+              sys.H_drift[idx(1, 2), idx(1, 2)]
     end
 end
 

@@ -30,12 +30,25 @@ serialized through NpEncoder — JSON primitives all the way down):
   axis the twin job server decodes): one payload, one expts axis, the
   per-expt drive amplitude stepped in gain codes.
 - gepi_baseline_rehearsal.json — the uncalibrated-baseline pi pulse (the
-  device calibration's own `pi_ge` gain, 8192 int codes -> 8192/32766
+  device calibration's own ``pi_ge`` gain, 8192 int codes -> 8192/32766
   fraction): the same compile + wire path the downstream consumption takes
   (dev.qubit.ge_pi() + Measure), at the STALE calibration gain the Rabi
   procedure exists to correct. The calibrated counterpart is compiled live
-  at the fitted gain (the bridge's `compile_ge_pi` at the believed pi_gain) —
+  at the fitted gain (the bridge's ``compile_ge_pi`` at the believed pi_gain) —
   its payload is a function of the fit and is never a fixture.
+- ramsey_rehearsal_NN.json — the Ramsey fringe's per-point jobs (issue #37):
+  one wave whose envelope carries half-pi arm, an in-wave silence gap of
+  ``RAMSEY_DELAYS_SAMPLES[k]`` samples, then the second half-pi arm. Swept
+  delays are wire-DEFERRED in v1 (the pack's ``wait(Sweep)`` compiles to tProc
+  TIME/register arithmetic, outside the payload reader's envelope-level lane,
+  and the CloseLoop ladder realizes gain steps only), so the delay rides the
+  ENVELOPE — the envelope-ride law — one payload per delay point.
+- t1_rehearsal_NN.json — the T1 decay's per-point jobs (issue #37): the
+  by-construction pi excitation then an in-wave silence gap of the declared
+  delay (sample-integral at the overlay's 12.5 samples/us).
+- confusion_g_rehearsal.json / confusion_e_rehearsal.json — the readout-
+  confusion preparations (issue #37): the zero-drive ground window and the
+  by-construction pi excited-prep, the counts the confusion recovery consumes.
 
 Every payload is deterministic given the device and the geometry (verified
 across fresh processes); the JSON is integer-dominated (register codes, int16
@@ -70,6 +83,41 @@ FREQS_KHZ = np.concatenate([np.arange(230.0, 350.1, 15.0), np.arange(520.0, 640.
 # step is (stop - 0)/(points - 1) = 3 codes exactly (integer by construction).
 RABI_GAIN_STOP = 120
 RABI_POINTS = 41
+
+# The calibration-set geometry (issue #37; the values are shared with
+# RamseyDesign / T1Design / ConfusionDesign in ext/bringup.jl).
+#
+# THE ENVELOPE-RIDE LAW, verified against the pack's own experiments (read
+# only): a swept DELAY — the pack's ``T1``/``T2Ramsey`` ``.wait(Sweep(on="t"))``
+# — compiles to tProc TIME/register arithmetic (REG_WR r_k + #step inside the
+# expts loop, a TIME-param site), which the twin job server's v1 payload
+# reader DEFERS: the expts axis is realized from the declared loop structure,
+# but per-expt VALUES ride the CloseLoop wave-memory ladder, which v1 realizes
+# for GAIN steps only; a swept-delay payload would replay the identical
+# envelope per expt and the delay would be invisible. The wire-realizable form
+# of a swept time axis is the ENVELOPE ITSELF: the delay rides the played
+# envelope as an in-wave silence gap (zeros — time-domain, not carrier), one
+# payload per delay point (the comb precedent: one job per swept point). The
+# probe shapes are envelope-authored sin^2 pulses at by-construction flip
+# angles (the comb probe's discipline: peak amplitude x integral = the flip):
+# half-pi for the Ramsey arms, pi for the T1 / confusion e-prep excitation.
+FS_MHZ = 12.5          # the rehearsal overlay's generator fabric (samples/us)
+T_HP_US = 4.0          # the sin^2 half-pi arm length (50 samples: clears qick's
+                       # 3-fabric-cycle envelope minimum like the comb's disp)
+T_PI_US = 4.0          # the sin^2 pi excitation length
+RAMSEY_PROBE_GAIN = np.pi / (T_HP_US * 1000.0)    # shaped flip pi/2 (ns units)
+T1_PROBE_GAIN = 2.0 * np.pi / (T_PI_US * 1000.0)  # shaped flip pi
+QUBIT_FREQ_MHZ = 4.0   # the probe carrier (the frame)
+# The Ramsey delay axis, in ENVELOPE SAMPLES (integer by construction: the
+# decoded axis is exactly the declared one). 9 points 0..512 samples
+# (0..40.96 us in 5.12-us steps): at the rehearsal twin's seeded detuning
+# truth (20 kHz) the fringe period is 50 us, so the grid resolves the first
+# minimum (~25 us) with ~5 points per fringe half-period.
+RAMSEY_DELAYS_SAMPLES = list(range(0, 513, 64))
+# The T1 delay axis, in MICROSECONDS chosen sample-integral at 12.5 samples/us
+# (0.08-us resolution). 9 points 0..240 us ~ 2x the record's T1_q_us (120 us):
+# the decay fit's information range.
+T1_DELAYS_US = [0.0, 20.0, 40.0, 60.0, 90.0, 120.0, 160.0, 200.0, 240.0]
 
 
 def comb_point(dev, f_khz):
@@ -135,6 +183,83 @@ def gepi_baseline_point(dev):
     return prog.to_compiled_job(overlay_id="rehearsal-v2", soft_avgs=1).to_wire()
 
 
+def _sin2_arm(n_samp, fs):
+    """One sin^2 probe arm on the DAC grid (peak 1, the comb probe's shape
+    class: starts and ends at ~0, so arms concatenate with silence gaps)."""
+    t = np.arange(n_samp) / fs
+    return np.sin(np.pi * t / (n_samp / fs)) ** 2
+
+
+def ramsey_point(dev, delay_samples):
+    """The Ramsey fringe point (issue #37): ONE wave whose envelope carries the
+    whole sequence — half-pi arm, an in-wave silence gap of ``delay_samples``
+    envelope samples (the envelope-ride law; see the geometry constants), then
+    the second half-pi arm. The delay is the SCHEDULE point; the payload is the
+    single source of truth for the decoded axis."""
+    from strumento.core.pulses import Arb, Pulse, Seq
+    from strumento.core.program import StrumentoProgram
+    from strumento.core.wiring import LineRef
+
+    n_hp = int(round(T_HP_US * FS_MHZ))
+    arm = _sin2_arm(n_hp, FS_MHZ)
+    idata = np.concatenate([arm, np.zeros(delay_samples), arm])
+    probe = Pulse(
+        line=LineRef("qubit", "drive"), freq_mhz=QUBIT_FREQ_MHZ,
+        gain=RAMSEY_PROBE_GAIN,
+        envelope=Arb(idata=idata.tolist(), qdata=np.zeros(len(idata)).tolist()),
+        label="ramsey_probe",
+    )
+    prog = StrumentoProgram(dev, seq=Seq().play(probe).measure(), reps=REPS)
+    return prog.to_compiled_job(overlay_id="rehearsal-v2", soft_avgs=1).to_wire()
+
+
+def t1_point(dev, delay_samples):
+    """The T1 decay point (issue #37): ONE wave whose envelope carries the
+    by-construction pi excitation then an in-wave silence gap of
+    ``delay_samples`` samples. The idle population decays at exactly the
+    ancilla T1 (the cavity starts in vacuum), so the e-frequency vs the
+    decoded delay is the exponential the fit consumes."""
+    from strumento.core.pulses import Arb, Pulse, Seq
+    from strumento.core.program import StrumentoProgram
+    from strumento.core.wiring import LineRef
+
+    n_pi = int(round(T_PI_US * FS_MHZ))
+    idata = np.concatenate([_sin2_arm(n_pi, FS_MHZ), np.zeros(delay_samples)])
+    probe = Pulse(
+        line=LineRef("qubit", "drive"), freq_mhz=QUBIT_FREQ_MHZ,
+        gain=T1_PROBE_GAIN,
+        envelope=Arb(idata=idata.tolist(), qdata=np.zeros(len(idata)).tolist()),
+        label="t1_probe",
+    )
+    prog = StrumentoProgram(dev, seq=Seq().play(probe).measure(), reps=REPS)
+    return prog.to_compiled_job(overlay_id="rehearsal-v2", soft_avgs=1).to_wire()
+
+
+def confusion_points(dev):
+    """The readout-confusion preparations (issue #37): the g-prep (a zero-drive
+    window — the ancilla stays in the ground state it starts in) and the e-prep
+    (the by-construction pi excitation; the record's T1-corrected row-2
+    recovery unwinds the decay over the played window)."""
+    from strumento.core.pulses import Arb, Pulse, Seq
+    from strumento.core.program import StrumentoProgram
+    from strumento.core.wiring import LineRef
+
+    n_pi = int(round(T_PI_US * FS_MHZ))
+
+    def wire(label, gain, idata):
+        probe = Pulse(
+            line=LineRef("qubit", "drive"), freq_mhz=QUBIT_FREQ_MHZ, gain=gain,
+            envelope=Arb(idata=idata.tolist(), qdata=np.zeros(len(idata)).tolist()),
+            label=label,
+        )
+        prog = StrumentoProgram(dev, seq=Seq().play(probe).measure(), reps=REPS)
+        return prog.to_compiled_job(overlay_id="rehearsal-v2", soft_avgs=1).to_wire()
+
+    g = wire("confusion_zero", 0.0, np.zeros(n_pi))
+    e = wire("confusion_pi", T1_PROBE_GAIN, _sin2_arm(n_pi, FS_MHZ))
+    return g, e
+
+
 def main():
     from strumento import Device
 
@@ -150,7 +275,22 @@ def main():
         json.dump(rabi_point(dev), fh)
     with open(os.path.join(OUTDIR, "gepi_baseline_rehearsal.json"), "w") as fh:
         json.dump(gepi_baseline_point(dev), fh)
-    print(f"wrote {len(FREQS_KHZ)} comb points + 1 cavity + 1 rabi + 1 ge-pi baseline payload to {OUTDIR}")
+    for k, d in enumerate(RAMSEY_DELAYS_SAMPLES):
+        path = os.path.join(OUTDIR, f"ramsey_rehearsal_{k:02d}.json")
+        with open(path, "w") as fh:
+            json.dump(ramsey_point(dev, int(d)), fh)
+    for k, us in enumerate(T1_DELAYS_US):
+        path = os.path.join(OUTDIR, f"t1_rehearsal_{k:02d}.json")
+        with open(path, "w") as fh:
+            json.dump(t1_point(dev, int(round(us * FS_MHZ))), fh)
+    g, e = confusion_points(dev)
+    with open(os.path.join(OUTDIR, "confusion_g_rehearsal.json"), "w") as fh:
+        json.dump(g, fh)
+    with open(os.path.join(OUTDIR, "confusion_e_rehearsal.json"), "w") as fh:
+        json.dump(e, fh)
+    print(f"wrote {len(FREQS_KHZ)} comb points + 1 cavity + 1 rabi + 1 ge-pi baseline "
+          f"+ {len(RAMSEY_DELAYS_SAMPLES)} ramsey + {len(T1_DELAYS_US)} t1 + 2 confusion "
+          f"payloads to {OUTDIR}")
 
 
 if __name__ == "__main__":

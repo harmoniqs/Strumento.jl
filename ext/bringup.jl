@@ -679,36 +679,10 @@ end
 
 function _wire_predict(rig::RehearsalRig, params::Dict{Symbol,Float64},
                        job::BringupJob)
-    js = _jobserver_ext()
-    payload = js.read_payload(rig.server.soccfg, job.job_wire)
-    drives = js.translate_drive(payload)
-    nsamp = maximum(length(d.times) for d in values(drives))
-    gen_chs = sort(collect(keys(drives)))
-    routing, n_drives = js._payload_routing(rig.server, gen_chs)
-    times = [1e9 * (i - 1) / payload.gen_cfg[gen_chs[1]].fs_hz for i in 1:nsamp]
-    ctrls = zeros(Float64, n_drives, nsamp)
-    for (gen_ch, i_drive, q_drive) in routing
-        d = drives[gen_ch]
-        pad = zeros(nsamp - length(d.times))
-        ctrls[i_drive, :] .= vcat(d.uI, pad)
-        q_drive === nothing || (ctrls[q_drive, :] .= vcat(d.uQ, pad))
-    end
-    recon = LinearSplinePulse(ctrls, times)
-
-    # the family system at the CANDIDATE parameters (the belief's parameter
-    # view — the fit never sees the twin's truth), the same rollout and
-    # measurement the soc performs, and the soc's own confusion (the record's
-    # — the v1 response model's readout). The remap is the soc's own arithmetic
-    # (`_respond`'s explicit sum, not a BLAS product): the degenerate
-    # belief == truth case must reproduce the server's exact response
-    # BIT-for-bit, and the two accumulation orders differ in the last ulp.
-    system = rig.families[rig.twin.record.family](params)
-    ψ = rig.soc.ψ_init
-    ρ0 = ψ * ψ'
-    qtraj = DensityTrajectory(system, recon, ρ0, ρ0)
-    p = rig.measurement_fn(Piccolo.density_to_iso_vec(qtraj(times[end])))
-    confusion = _piccolo_ext()._record_confusion(rig.twin)
-    return [sum(confusion[i, j] * p[i] for i in eachindex(p)) for j in eachindex(p)]
+    # the comb-era body, split so the calibration-set jobs (the Ramsey/T1/
+    # confusion payloads — not BringupJobs) share the one belief-side wire
+    # model (`_wire_predict_wire`, issue #37); this signature is unchanged.
+    return _wire_predict_wire(rig, params, job.job_wire)
 end
 
 """The `fit` seam (#38 wraps here): the certification fit class — weighted
@@ -2047,6 +2021,686 @@ end
             finally
                 ext.stop!(rig)
             end
+        end
+    end
+end
+
+# ─── The Ramsey procedure (issue #37, the M4a-3 calibration set) ────────────────
+#
+# The detuning calibration: the ancilla π/2–delay–π/2 fringe vs delay over the
+# wire, the detuning fit, and the `detuning_kHz` belief entry — the frame
+# offset no prior procedure measures. THE ENVELOPE-RIDE LAW (verified against
+# the pack's own T1/T2Ramsey experiments, read-only): a swept DELAY compiles to
+# tProc TIME/register arithmetic (REG_WR r_k + #step inside the expts loop —
+# the compiler's swept-Delay "time-param" site), which the M3a payload reader
+# DEFERS: the expts axis is realized from the declared loop structure, but
+# per-expt VALUES ride the CloseLoop wave-memory ladder, which v1 realizes for
+# GAIN steps only — a swept-delay payload replays the identical envelope every
+# expt and the delay is invisible. The wire-realizable form of a swept time
+# axis is the ENVELOPE ITSELF: each delay point is ONE payload whose single
+# wave carries [half-π arm, in-wave silence gap of `delay_samples` zeros,
+# half-π arm] — time-domain, not carrier (the frame law governs: the carrier is
+# the frame; delays ride the envelope) — one job per schedule point, the comb
+# precedent.
+#
+# The fringe: the twin's detuning truth (the optional `:detuning_kHz` family
+# key, issue #37 — the record's frame is nominal, so the hidden truth is seeded
+# into truth directly, the certify_parameter_recovery perturbation idiom
+# extended to a key the record does not carry) precesses the ancilla during the
+# gap, and the second half-π maps the accumulated phase onto the e-frequency.
+# The precession during the ARM time shifts the fringe's minimum off
+# 1/(2Δτ) — the fit never assumes the analytic phase: the model sweep rolls
+# the DECODED payload envelopes at the candidate detuning (the payload-driven
+# discipline — the model predicts exactly what the server executes).
+#
+# The G-curve applicability call (the issue asks; documented either way): the
+# idiom does NOT apply here. The Rabi G-curve worked because the swept pulse's
+# shape is FIXED and the candidate enters as a linear drive scale — one
+# response curve read at θ-rescaled gains, exactly. The Ramsey response is
+# not one curve read at Δ-rescaled delays: each delay point is a DIFFERENT
+# payload (the gap rides the envelope — there is no single probe response
+# curve to rescale), and the candidate detuning enters as a Hamiltonian term
+# that also tilts the half-π arms' rotation axes (Δ/Ω), so
+# response(τ; Δ) ≠ G(Δτ) — the pulse unitaries carry Δ. The honest fit is the
+# certification class's per-point payload-driven model cache (the comb
+# pattern), one rollout per (node × delay point).
+#
+# The fit: the certification fit class (`_CertModelCache` + `_cert_fit_1d`,
+# one fitter home), weighted binomial χ² against the payload-driven
+# belief-side model sweep over a DATA-anchored detuning bracket — the anchor
+# is the fringe's first measured minimum, parabolic-refined on the DECODED
+# delay axis, Δ_anchor = 1/(2·τ_min) — widened by the design's multipliers (the
+# arm-time precession shifts τ_min, so the multipliers must straddle generously).
+# σ from the fit's observed information, the recovery tolerance
+# `BOSONIC_CERT_TOLERANCE_SIGMA`·σ (5σ, never hand-picked).
+#
+# The belief key: `detuning_kHz` — a calibration BEYOND the record's parameter
+# set (the pi_gain precedent; calibrate! merges new keys), never a record
+# parameter (the record's frame is nominal — it carries no detuning), never
+# truth. THE COMPOSITION ORDER this motivates: the detuned twin shifts every
+# ancilla transition by Δ, so the comb's χ-fit (whose model would carry a
+# stale-frame belief) is biased until the detuning lands in belief — the
+# calibration set runs Ramsey FIRST (the Ramsey is the one procedure
+# insensitive to the others: the cavity sits in vacuum, and its arms are
+# envelope-authored, not gain-calibrated). See `run_calibration_set`.
+
+"""
+    RamseyDesign(; kwargs...) -> RamseyDesign
+
+The Ramsey procedure's pinned design — the arm geometry, the delay grid, and
+the fit's data-anchored bracket parameters.
+
+The arms: envelope-authored sin² half-π pulses of length `T_hp_us` (peak drive
+fraction `probe_gain = π/(T_hp_us·1000)`, the comb probe's by-construction
+flip convention: ∫A·sin²dτ = π/2) on the ancilla quadratures at the fixed
+carrier `qubit_freq_mhz` (the frame).
+
+The delay grid: `delays_samples` — the schedule's swept axis in the wire's
+lab-native unit, ENVELOPE SAMPLES (integer by construction: the decoded axis
+is exactly the declared one; the fixture payloads are compiled at the
+rehearsal overlay's 12.5 samples/μs). The committed default (9 points,
+0:64:512 samples = 0..40.96 μs in 5.12-μs steps) resolves the fringe at the
+rehearsal twin's detuning scale (tens of kHz: the first minimum sits near
+25 μs) with ≥5 points per fringe half-period.
+
+The fit (all anchors DERIVED from the measured fringe, never absolute
+hand-picked spans): the bracket is `[bracket_lo_frac, bracket_hi_frac] ×`
+Δ_anchor (the parabolic-refined first minimum; the arm-time precession biases
+the anchor high by ~20%, so the multipliers straddle wider than the Rabi's) —
+the θ-model cache steps `fit_grid_step_kHz`; the golden section refines to
+`fit_tol_frac ×` Δ_anchor.
+
+The π/2–delay–π/2 probe shape is FIXED (only the gap length steps along the
+schedule), but the G-curve idiom does NOT apply — see the section docstring:
+each point is a different payload and the detuning tilts the arms, so the fit
+evaluates the payload-driven model sweep per node (the comb pattern), not one
+rescaled response curve.
+"""
+struct RamseyDesign
+    T_hp_us::Float64
+    delays_samples::Vector{Int}
+    probe_gain::Float64
+    qubit_freq_mhz::Float64
+    reps::Int
+    soft_avgs::Int
+    bracket_lo_frac::Float64
+    bracket_hi_frac::Float64
+    fit_grid_step_kHz::Float64
+    fit_tol_frac::Float64
+end
+
+function RamseyDesign(; T_hp_us = 4.0, delays_samples = collect(0:64:512),
+                      probe_gain = π / (4.0 * 1000.0), qubit_freq_mhz = 4.0,
+                      reps = 50, soft_avgs = 1,
+                      bracket_lo_frac = 0.55, bracket_hi_frac = 1.35,
+                      fit_grid_step_kHz = 0.6, fit_tol_frac = 1 / 20000)
+    T_hp_us > 0 || error("RamseyDesign: T_hp_us must be > 0 (got $T_hp_us)")
+    probe_gain > 0 || error("RamseyDesign: probe_gain must be > 0 (got $probe_gain)")
+    qubit_freq_mhz > 0 || error(
+        "RamseyDesign: qubit_freq_mhz must be > 0 (got $qubit_freq_mhz)")
+    isempty(delays_samples) && error("RamseyDesign: delays_samples must be non-empty")
+    all(>=(0), delays_samples) || error(
+        "RamseyDesign: delays_samples must be ≥ 0 (the fringe's first point " *
+        "is the zero-delay reference)")
+    issorted(delays_samples) || error("RamseyDesign: delays_samples must be sorted")
+    allunique(delays_samples) || error(
+        "RamseyDesign: delays_samples must be unique (the decoded axis steps)")
+    length(delays_samples) ≥ 5 || error(
+        "RamseyDesign: the delay grid needs at least 5 points (a maximum, the " *
+        "fringe's falling flank, a minimum, its rising flank, and resolution)")
+    reps ≥ 1 || error("RamseyDesign: reps must be ≥ 1 (got $reps)")
+    soft_avgs ≥ 1 || error("RamseyDesign: soft_avgs must be ≥ 1 (got $soft_avgs)")
+    (0 < bracket_lo_frac < 1 < bracket_hi_frac) || error(
+        "RamseyDesign: the bracket multipliers must straddle the first " *
+        "minimum's anchor (0 < bracket_lo_frac < 1 < bracket_hi_frac; got " *
+        "[$bracket_lo_frac, $bracket_hi_frac])")
+    fit_grid_step_kHz > 0 || error(
+        "RamseyDesign: fit_grid_step_kHz must be > 0 (got $fit_grid_step_kHz)")
+    0 < fit_tol_frac || error("RamseyDesign: fit_tol_frac must be > 0 (got $fit_tol_frac)")
+    return RamseyDesign(Float64(T_hp_us), Int.(delays_samples), Float64(probe_gain),
+        Float64(qubit_freq_mhz), Int(reps), Int(soft_avgs), Float64(bracket_lo_frac),
+        Float64(bracket_hi_frac), Float64(fit_grid_step_kHz), Float64(fit_tol_frac))
+end
+
+"""The design's declared delay axis in microseconds (decoded from the wire's
+lab-native envelope samples at the rig's fabric rate)."""
+ramsey_axis_us(rig::RehearsalRig, design::RamseyDesign) =
+    [s / (rig.soc.dac_rate * 1000.0) for s in design.delays_samples]
+
+"""The design's arm + delay geometry as the bridge's compile contract (the
+`compile_ramsey_point` keyword block — the same constants the committed
+fixture-generation script carries)."""
+ramsey_geometry(design::RamseyDesign) = (
+    T_hp_us = design.T_hp_us,
+    probe_gain = design.probe_gain,
+    qubit_freq_mhz = design.qubit_freq_mhz,
+    reps = design.reps,
+    soft_avgs = design.soft_avgs,
+)
+
+"""The Ramsey schedule (the `propose_ramsey` seam's output): the declared
+delay axis (μs, decoded at the rig's fabric rate) and the provenance the
+supervision layer (#38) wraps."""
+struct RamseySchedule
+    delays_us::Vector{Float64}
+    provenance::Dict{String,Any}
+end
+
+"""One Ramsey point's compiled job: its wire payload (the single wave carrying
+half-π arm, the in-wave silence gap, half-π arm — the envelope-ride law) with
+the accumulated shot count (`soc shots × payload reps × soft_avgs`)."""
+struct RamseyJob
+    delay_samples::Int
+    job_wire::Dict{String,Any}
+    shots::Int
+end
+
+"""The Ramsey fringe's measured responses (the `run_ramsey_over_wire` seam's
+output): the schedule, its jobs, the per-point e-outcome frequency on the
+DECODED delay axis, and the rehearsal provenance."""
+struct RamseyResult
+    schedule::RamseySchedule
+    jobs::Vector{RamseyJob}
+    responses::Vector{Float64}
+    delays_us::Vector{Float64}
+    provenance::Dict{String,Any}
+end
+
+"""The Ramsey fit's outcome: the fitted detuning (kHz) with its derived
+information scale, the 5σ recovery tolerance, the fit quality, the
+belief-agreement gate (against a prior `detuning_kHz` belief when one exists
+— the first calibration has nothing to disagree with), and the rehearsal
+provenance (mirrors `ResonatorSweepFit`)."""
+struct RamseyFit
+    detuning_kHz::Float64
+    detuning_sigma_kHz::Float64
+    detuning_tolerance_kHz::Float64
+    chi2_dof::Float64
+    agrees_with_belief::Bool
+    seed::Any
+    record_id::String
+    provenance::Dict{String,Any}
+end
+
+"""The `propose_ramsey` seam (#38 wraps here): (belief + schedule) -> the
+declared delay axis, validated. On a RE-CALIBRATION (the belief already
+carries `detuning_kHz`) the grid must RESOLVE the believed detuning's fringe:
+the window must reach its first minimum (`Δ·τ_max ≥ ½ cycle`) and the grid
+must step finer than a sixth of its period (the first calibration has no
+believed detuning to resolve; the fit's own first-minimum check is what
+refuses a window that misses the truth)."""
+function propose_ramsey(rig::RehearsalRig, design::RamseyDesign)
+    delays_us = ramsey_axis_us(rig, design)
+    prior = get(believed(rig.twin), "detuning_kHz", nothing)
+    if prior isa Real
+        Δ = Float64(prior)
+        τmax = delays_us[end]
+        Δ * τmax * 1e-3 ≥ 0.5 || error(
+            "propose_ramsey: the declared delay window [0, $(τmax) μs] does not " *
+            "reach the believed detuning's first fringe minimum (the belief's " *
+            "detuning_kHz = $Δ wants τ ≈ $(1 / (2Δ * 1e-3)) μs) — the belief and " *
+            "the schedule disagree; re-author the grid or recalibrate the belief")
+        step = length(delays_us) > 1 ? delays_us[2] - delays_us[1] : 0.0
+        step > 0 && Δ * step * 1e-3 ≤ 1 / 6 || error(
+            "propose_ramsey: the declared delay grid steps $(step) μs — coarser " *
+            "than a sixth of the believed detuning's fringe period " *
+            "($(1 / (Δ * 1e-3)) μs at detuning_kHz = $Δ); the fringe would alias")
+    end
+    return RamseySchedule(
+        delays_us,
+        Dict{String,Any}(
+            "record_id" => rig.twin.record.id,
+            "overlay_id" => rig.overlay_id,
+            "device_path" => rig.device_path,
+            "evidence_class" => "twin-rehearsal",
+        ),
+    )
+end
+
+"""The compile seam's fixture lane: the committed Ramsey payloads (the
+Julia-only path — CI without Python `strumento` runs the whole procedure
+against them; the bridge testitem pins that the live Python compile reproduces
+them bit-exactly). One payload per schedule point, index-ordered — the
+committed grid's own order."""
+function fixture_ramsey_jobs(rig::RehearsalRig, schedule::RamseySchedule)
+    fixtures = joinpath(pkgdir(Strumento), "test", "fixtures", "_fixtures")
+    jobs = RamseyJob[]
+    for i in 1:length(schedule.delays_us)
+        path = joinpath(fixtures, "ramsey_rehearsal_$(lpad(i - 1, 2, '0')).json")
+        isfile(path) || error(
+            "fixture_ramsey_jobs: the committed fixture $path is missing — the " *
+            "fixture lane expects one payload per delay point (regenerate with " *
+            "test/fixtures/_fixtures/generate_rehearsal_payloads.py)")
+        job = JSON.parsefile(path)
+        push!(jobs, RamseyJob(0, job, _job_shots(rig, job)))
+    end
+    return jobs
+end
+
+"""The `run_ramsey_over_wire` seam (#38 wraps here): run each delay point's
+payload over the wire (the production shape — the socket, never in-process
+server calls) and reduce each `RawAcquisition` to the per-point e-outcome
+frequency. The payload is the single source of truth on the DELAY AXIS: one
+played generator (the ancilla drive), one wave whose envelope carries the
+whole sequence, and its decoded length must equal the declared arm+gap
+geometry — a payload compiled against a different grid is refused (the fit's
+axis is the DECODED one, never the declared)."""
+function run_ramsey_over_wire(rig::RehearsalRig, schedule::RamseySchedule,
+                              design::RamseyDesign, jobs::Vector{RamseyJob})
+    js = _jobserver_ext()
+    length(jobs) == length(schedule.delays_us) || error(
+        "run_ramsey_over_wire: $(length(jobs)) compiled jobs for " *
+        "$(length(schedule.delays_us)) schedule points — one payload per point")
+    n_hp = round(Int, design.T_hp_us * rig.soc.dac_rate * 1000.0)
+    n_hp ≥ 1 || error(
+        "run_ramsey_over_wire: the arm geometry T_hp_us = $(design.T_hp_us) " *
+        "decodes to $n_hp envelope samples at the rig's fabric rate — a played " *
+        "arm must have positive extent")
+    responses = Float64[]
+    delays_us = Float64[]
+    for (i, job) in enumerate(jobs)
+        payload = js.read_payload(rig.server.soccfg, job.job_wire)
+        payload.expts === nothing || error(
+            "run_ramsey_over_wire: the payload declares an expts axis — the " *
+            "Ramsey delay axis is the ENVELOPE (one payload per point; a swept " *
+            "delay is wire-deferred in v1 — see the section docstring)")
+        length(payload.port_plan) == 1 && length(payload.port_plan[1][2]) == 1 || error(
+            "run_ramsey_over_wire: the payload plays $(length(payload.port_plan)) " *
+            "generators — the Ramsey probe is one ancilla drive wave")
+        wave = payload.waves[payload.port_plan[1][2][1]]
+        nsamp = wave.length_cycles * payload.gen_cfg[payload.port_plan[1][1]].samps_per_clk
+        # the decoded delay: the wave's whole played length minus the two arms
+        # — validated against the declared grid (the payload is the single
+        # source of truth on the axis)
+        delay_samples = nsamp - 2 * n_hp
+        delay_samples == design.delays_samples[i] || error(
+            "run_ramsey_over_wire: the design's declared delay " *
+            "$(design.delays_samples[i]) samples does not match the payload's " *
+            "decoded gap ($delay_samples samples, wave length $nsamp = " *
+            "$(2 * n_hp) arm + gap) — compile the design's own grid (the bridge " *
+            "lane) or re-author the design to the committed geometry")
+        acq = run_job(rig.client, job.job_wire)
+        iq = get(acq, "iq", nothing)
+        (iq isa AbstractVector && length(iq) == 1 && length(iq[1]) == 1 &&
+         length(iq[1][1]) == 2) || error(
+            "run_ramsey_over_wire: the per-point acquisition must be one read's " *
+            "(I, Q) pair (the twin's v1 one-readout response)")
+        push!(responses, Float64(iq[1][1][2]))
+        push!(delays_us, delay_samples / (rig.soc.dac_rate * 1000.0))
+    end
+    return RamseyResult(schedule, jobs, responses, delays_us,
+        Dict{String,Any}(
+            "schedule_provenance" => schedule.provenance,
+            "evidence_class" => "twin-rehearsal",
+            "seed" => rig.seed,
+            "overlay_id" => rig.overlay_id,
+            "twin_time_days" => rig.twin.t,
+        ))
+end
+
+# The belief-side wire model over a raw wire payload (the `_wire_predict`
+# body, split so the Ramsey jobs — which are not BringupJobs — share it; the
+# comb's original signature is a thin wrapper, unchanged).
+function _wire_predict_wire(rig::RehearsalRig, params::Dict{Symbol,Float64},
+                            job_wire::AbstractDict)
+    js = _jobserver_ext()
+    payload = js.read_payload(rig.server.soccfg, job_wire)
+    drives = js.translate_drive(payload)
+    nsamp = maximum(length(d.times) for d in values(drives))
+    gen_chs = sort(collect(keys(drives)))
+    routing, n_drives = js._payload_routing(rig.server, gen_chs)
+    times = [1e9 * (i - 1) / payload.gen_cfg[gen_chs[1]].fs_hz for i in 1:nsamp]
+    ctrls = zeros(Float64, n_drives, nsamp)
+    for (gen_ch, i_drive, q_drive) in routing
+        d = drives[gen_ch]
+        pad = zeros(nsamp - length(d.times))
+        ctrls[i_drive, :] .= vcat(d.uI, pad)
+        q_drive === nothing || (ctrls[q_drive, :] .= vcat(d.uQ, pad))
+    end
+    recon = LinearSplinePulse(ctrls, times)
+
+    # the family system at the CANDIDATE (belief-side) parameters — the fit
+    # never sees the twin's truth — with the soc's own confusion (the record's
+    # readout model) and the soc's own remap arithmetic (the degenerate
+    # belief == truth case must reproduce the server's exact response
+    # BIT-for-bit, and the two accumulation orders differ in the last ulp).
+    system = rig.families[rig.twin.record.family](params)
+    ψ = rig.soc.ψ_init
+    ρ0 = ψ * ψ'
+    qtraj = DensityTrajectory(system, recon, ρ0, ρ0)
+    p = rig.measurement_fn(Piccolo.density_to_iso_vec(qtraj(times[end])))
+    confusion = _piccolo_ext()._record_confusion(rig.twin)
+    return [sum(confusion[i, j] * p[i] for i in eachindex(p)) for j in eachindex(p)]
+end
+
+"""The `fit_ramsey` seam (#38 wraps here): the certification fit class —
+weighted binomial χ² of the measured fringe against the payload-driven
+belief-side model sweep over the DATA-anchored detuning bracket
+(`_CertModelCache` + `_cert_fit_1d`, the Piccolo extension's fit home — one
+fitter, no duplication), σ from the fit's own observed information, the
+recovery tolerance `BOSONIC_CERT_TOLERANCE_SIGMA`·σ.
+
+The bracket anchors on the fringe's FIRST measured minimum — the π/2–π/2
+fringe starts at its maximum, so the first minimum sits at the half-period —
+parabolic-refined on the decoded delay axis, `Δ_anchor = 1/(2·τ_min)`. The
+arm-time precession shifts the minimum (the analytic 1/(2Δ) does NOT hold
+exactly), so the anchor is a bracket-centering heuristic only (the design's
+multipliers straddle generously); the FIT itself is payload-driven and
+assumes nothing about the phase. A fringe that never dips is refused
+actionably (the window does not resolve the detuning)."""
+function fit_ramsey(rig::RehearsalRig, design::RamseyDesign, result::RamseyResult)
+    pc = _piccolo_ext()
+    belief = believed(rig.twin)
+    bparams = Dict{Symbol,Float64}(
+        Symbol(k) => Float64(v) for (k, v) in belief if v isa Real)
+    n = length(result.responses)
+    n == length(result.delays_us) || error(
+        "fit_ramsey: $(n) measured responses on a $(length(result.delays_us))—" *
+        "point axis — one response per decoded delay point")
+
+    # every job's accumulated shots (the binomial weights); constant by
+    # construction of the schedule, and validated so
+    shots = unique([job.shots for job in result.jobs])
+    length(shots) == 1 || error(
+        "fit_ramsey: the schedule's payloads carry different accumulated shot " *
+        "counts ($(shots)) — the fit's binomial weights need one count")
+    shots[1] ≥ 1 || error("fit_ramsey: the accumulated shot count must be ≥ 1")
+
+    # the data anchor: the fringe's first measured minimum, parabolic-refined
+    # on the decoded delay axis
+    e_min = findfirst(e -> 2 <= e <= n - 1 &&
+                            result.responses[e] < result.responses[e - 1] &&
+                            result.responses[e] <= result.responses[e + 1],
+                       1:n)
+    e_min === nothing && error(
+        "fit_ramsey: the measured fringe exhibits no minimum — the declared " *
+        "delay window [0, $(result.delays_us[end])] μs does not resolve the " *
+        "detuning's half-period; re-author the grid (lengthen the window)")
+    τ = result.delays_us
+    y = result.responses
+    denom = y[e_min - 1] - 2y[e_min] + y[e_min + 1]
+    off = abs(denom) < 1e-12 ? 0.0 : 0.5 * (y[e_min - 1] - y[e_min + 1]) / denom
+    τ_min = τ[e_min] + off * (τ[e_min + 1] - τ[e_min - 1]) / 2
+    τ_min > 0 || error(
+        "fit_ramsey: the fringe's first minimum sits at τ ≤ 0 — the measured " *
+        "response is not a Ramsey fringe on this axis")
+    anchor_kHz = 1 / (2τ_min * 1e-3)
+    lo = design.bracket_lo_frac * anchor_kHz
+    hi = design.bracket_hi_frac * anchor_kHz
+
+    # the belief-side model sweep at candidate detuning: the payload-driven
+    # prediction, one per schedule point (each point's own envelope — the
+    # arms AND the gap — rolled at the candidate parameters)
+    model_sweep_at(θ) =
+        [_wire_predict_wire(rig, merge(bparams, Dict{Symbol,Float64}(:detuning_kHz => θ)),
+                            job.job_wire)[2] for job in result.jobs]
+    cache = pc._CertModelCache(model_sweep_at, lo, hi, design.fit_grid_step_kHz)
+    fit_design = pc.BosonicCertDesign(fit_tol_kHz = design.fit_tol_frac * anchor_kHz)
+    Δ̂, chi2min, σ, _ = pc._cert_fit_1d(cache, result.responses, shots[1], fit_design)
+
+    tolerance = pc.BOSONIC_CERT_TOLERANCE_SIGMA * σ
+    dof = max(n - 1, 1)
+    prior = get(belief, "detuning_kHz", nothing)
+    agrees = !(prior isa Real) || abs(Δ̂ - Float64(prior)) ≤ tolerance
+    return RamseyFit(Δ̂, σ, tolerance, chi2min / dof, agrees,
+        result.provenance["seed"], rig.twin.record.id,
+        Dict{String,Any}(
+            "record_id" => rig.twin.record.id,
+            "record_path" => rig.record_path,
+            "design" => "$(n) delay points x $(shots[1]) shots; bracket " *
+                        "[$(lo), $(hi)] kHz (first min $(round(τ_min; digits=2)) μs)",
+            "tolerance_rule" => string(
+                "recovery within $(pc.BOSONIC_CERT_TOLERANCE_SIGMA)·σ; σ from " *
+                "the fit's observed binomial information (the model Jacobian " *
+                "vs q̂(1−q̂)/N on the payload-driven wire model sweep)"),
+            "evidence_class" => "twin-rehearsal",
+            "tool" => "Strumento v$(pkgversion(Strumento)), julia $(VERSION)",
+        ))
+end
+
+"""The `write_back` seam (#38 wraps here): the fitted detuning lands in the
+twin's BELIEF via `calibrate!` — never truth, and never a record parameter
+(the record's frame is nominal: it carries no detuning key; the entry is the
+first frame calibration beyond the record's parameter set, the pi_gain
+precedient's merge contract)."""
+function write_back!(rig::RehearsalRig, fitres::RamseyFit)
+    calibrate!(rig.twin, Dict{String,Any}("detuning_kHz" => fitres.detuning_kHz))
+    return rig
+end
+
+"""
+    run_ramsey_sweep(rig, design; jobs = fixture_ramsey_jobs) -> RamseyFit
+
+The Ramsey chain, one call: propose → compile → run over the wire → fit →
+write back. `jobs` is the compile seam's source: the committed fixture
+payloads (the default — the Julia-only lane) or a live bridge source (the
+PythonCall extension's `compile_ramsey_point` over the design's
+`ramsey_geometry`, one payload per delay point).
+
+Everything is a pure function of (rig, design, jobs, the twin's seed): a
+procedure run replays bit-exactly from its seed across fresh processes (the
+replay check: `test/configurations/calibration_replay_check.jl`).
+"""
+function run_ramsey_sweep(rig::RehearsalRig, design::RamseyDesign;
+                         jobs = fixture_ramsey_jobs)
+    schedule = propose_ramsey(rig, design)
+    payloads = jobs isa Function ? jobs(rig, schedule) : jobs
+    result = run_ramsey_over_wire(rig, schedule, design, payloads)
+    fitres = fit_ramsey(rig, design, result)
+    write_back!(rig, fitres)
+    return fitres
+end
+
+# the live bridge lane's job source: a per-point compiler (delay samples ->
+# wire Dict — the bridge's `compile_ramsey_point` over the design's geometry)
+# wrapped into a job source for `run_ramsey_sweep`.
+function ramsey_point_jobs(compile_point, rig::RehearsalRig,
+                           schedule::RamseySchedule, design::RamseyDesign)
+    jobs = RamseyJob[]
+    for (i, s) in enumerate(design.delays_samples)
+        wire = compile_point(s)
+        push!(jobs, RamseyJob(s, wire, _job_shots(rig, wire)))
+    end
+    return jobs
+end
+
+@testitem "the Ramsey procedure recovers the detuning through the wire within the DERIVED tolerance (the frame belief entry)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (bring-up extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        using Strumento: DriftPlan, instantiate, believed, advance!, calibrate!,
+                         OrnsteinUhlenbeck
+        ext = Base.get_extension(Strumento, :StrumentoBringupExt)
+        js = Base.get_extension(Strumento, :StrumentoJobServerExt)
+
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        record = joinpath(fixtures, "twins", "bosonic.md")
+        device = joinpath(fixtures, "multimode_rehearsal", "device.yaml")
+        soccfg = joinpath(fixtures, "multimode_rehearsal", "soccfg_v2_rehearsal.json")
+        wiring = TwinWiringMap([
+            TwinGenWiring(2, 1, 2; line = "qubit.drive"),
+            TwinGenWiring(3, 3, 4; line = "manipulate.main"),
+        ]; n_drives = 4)
+
+        # a DRIFTED twin (the rehearsal posture) whose truth also carries the
+        # seeded DETUNING — the hidden-truth discipline: the record's frame
+        # is nominal (it carries no detuning parameter; the family's optional
+        # key defaults to 0), so the truth is seeded directly, exactly the
+        # certify_parameter_recovery perturbation idiom extended to a key
+        # the record does not carry. The calibration must find it.
+        plan = DriftPlan(:chi_kHz => [OrnsteinUhlenbeck(theta = 0.07, sigma = 3.0,
+                                                        mu = -298.4)])
+        make_rig(seed) = ext.RehearsalRig(record, device, soccfg, wiring;
+                                         drift = plan, seed = seed,
+                                         overlay_id = "rehearsal-v2")
+        rig = make_rig(0xC0FFEE)
+        try
+            advance!(rig.twin, 3.0)
+            rig.twin.truth[:detuning_kHz] = 20.0        # the hidden frame offset
+            truth_chi = rig.twin.truth[:chi_kHz]
+            n_truth = length(rig.twin.truth)
+            design = ext.RamseyDesign()
+
+            # the detuning entry is NOT on the record: the belief starts as
+            # the record's 7 parameters (the frame is nominal — nothing to
+            # disagree with), and the truth carries the seeded key
+            @test !haskey(believed(rig.twin), "detuning_kHz")
+            @test !any(==(Symbol("detuning_kHz")), keys(rig.twin.record.parameters))
+
+            fitres = ext.run_ramsey_sweep(rig, design)   # propose -> wire -> fit -> write back
+
+            # ── the fit is REAL and recovers the seeded truth within the
+            # DERIVED tolerance (never a hand-picked one): 5·σ, σ from the
+            # fit's observed binomial information
+            pc = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+            @test fitres.detuning_kHz !== nothing
+            @test abs(fitres.detuning_kHz - 20.0) < fitres.detuning_tolerance_kHz
+            @test fitres.detuning_tolerance_kHz ≈ pc.BOSONIC_CERT_TOLERANCE_SIGMA *
+                                             fitres.detuning_sigma_kHz
+            @test 1e-5 < fitres.detuning_sigma_kHz < 0.5  # a real information scale
+            # the fit is a real procedure, not a restatement of the truth: the
+            # estimate sits off the truth (shot noise) with a sound residual
+            @test fitres.detuning_kHz != 20.0
+            @test 0.1 < fitres.chi2_dof < 4.0
+
+            # the belief-agreement flag is its DEFINITION: with no prior
+            # detuning belief there is nothing to disagree with
+            @test fitres.agrees_with_belief
+
+            # ── the write-back: the belief entry lands via calibrate!;
+            # believed reflects it; the truth/belief invariants hold live
+            @test believed(rig.twin)["detuning_kHz"] == fitres.detuning_kHz
+            # the detuning is a BELIEF key beyond the record's parameter set
+            # (the pi_gain precedent); truth is untouched by the calibration
+            @test length(believed(rig.twin)) == 8       # the record's 7 + the frame
+            @test length(rig.twin.truth) == n_truth     # truth keys untouched
+            @test rig.twin.truth[:detuning_kHz] == 20.0
+            @test rig.twin.truth[:chi_kHz] == truth_chi
+
+            # drift moves truth ONLY: aging the twin leaves the calibrated
+            # belief exactly where the write-back put it
+            advance!(rig.twin, 1.0)
+            @test believed(rig.twin)["detuning_kHz"] == fitres.detuning_kHz
+            @test rig.twin.truth[:chi_kHz] != truth_chi
+
+            # the rehearsal evidence marking: twin-rehearsal, never device results
+            @test fitres.provenance["evidence_class"] == "twin-rehearsal"
+            @test fitres.seed == 0xC0FFEE
+            @test fitres.record_id == rig.twin.record.id
+
+            # ── a RE-CALIBRATION against the prior belief: the second run's
+            # agrees_with_belief is computed against the written-back entry
+            fit2 = ext.run_ramsey_sweep(rig, design)
+            @test fit2.agrees_with_belief ==
+                  (abs(fit2.detuning_kHz - fitres.detuning_kHz) ≤
+                       fit2.detuning_tolerance_kHz)
+            @test fit2.agrees_with_belief          # a sound recalibration agrees
+
+            # ── the propose seam's belief/schedule validation: once the belief
+            # carries the detuning, a window that cannot resolve its fringe
+            # is refused — the belief and the schedule disagree (a SHORT grid:
+            # the shape checks pass, the resolvability check is what fires)
+            err = try
+                ext.propose_ramsey(rig, ext.RamseyDesign(
+                    delays_samples = collect(0:8:32))); nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("first fringe minimum", sprint(showerror, err))
+
+            # ── the run seam's decoded-axis refusal: a design whose declared
+            # grid differs from the payloads the wire actually runs is refused
+            # (the payload is the single source of truth — the fit's axis is
+            # the DECODED one). This grid is sample-integral and sorted (the
+            # shape checks pass) but is not the committed geometry.
+            err = try
+                ext.run_ramsey_sweep(rig, ext.RamseyDesign(
+                    delays_samples = collect(0:48:384))); nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("does not match", sprint(showerror, err))
+            # (the fit's honest "no minimum" refusal on a fringe that never
+            # dips needs a live compile of a short window — the fixture lane
+            # runs the committed geometry only; it is pinned in the bridge
+            # testitem, the Rabi short-ladder precedent)
+        finally
+            ext.stop!(rig)
+        end
+
+        # ── seeded replay, in-process form: two FRESH rigs (fresh twins,
+        # fresh rngs, fresh wires) with the same seed reproduce the whole
+        # procedure bit-exactly; a different seed differs (the shot draws)
+        run_it(seed) = begin
+            r = make_rig(seed)
+            try
+                advance!(r.twin, 3.0)
+                r.twin.truth[:detuning_kHz] = 20.0
+                ext.run_ramsey_sweep(r, ext.RamseyDesign())
+            finally
+                ext.stop!(r)
+            end
+        end
+        a = run_it(0x5EED)
+        b = run_it(0x5EED)
+        c = run_it(0xFEED)
+        @test a.detuning_kHz == b.detuning_kHz
+        @test a.detuning_sigma_kHz == b.detuning_sigma_kHz
+        @test a.detuning_kHz != c.detuning_kHz
+    end
+end
+
+@testitem "the Ramsey belief-side wire model == the server's execution (degenerate cross-path pin)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (bring-up extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        using Strumento: DriftPlan, believed
+        ext = Base.get_extension(Strumento, :StrumentoBringupExt)
+        js = Base.get_extension(Strumento, :StrumentoJobServerExt)
+
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        record = joinpath(fixtures, "twins", "bosonic.md")
+        device = joinpath(fixtures, "multimode_rehearsal", "device.yaml")
+        soccfg = joinpath(fixtures, "multimode_rehearsal", "soccfg_v2_rehearsal.json")
+        wiring = TwinWiringMap([
+            TwinGenWiring(2, 1, 2; line = "qubit.drive"),
+            TwinGenWiring(3, 3, 4; line = "manipulate.main"),
+        ]; n_drives = 4)
+
+        # EXACT mode: the degenerate case (belief == truth, the seeded
+        # detuning included) must drive the predict and the server through
+        # two computation paths that agree bit-for-bit — the payload is the
+        # single source of truth on both sides, per delay point.
+        rig = ext.RehearsalRig(record, device, soccfg, wiring;
+                               drift = DriftPlan(), seed = 0xC0FFEE,
+                               overlay_id = "rehearsal-v2", exact = true)
+        try
+            rig.twin.truth[:detuning_kHz] = 20.0
+            schedule = ext.propose_ramsey(rig, ext.RamseyDesign())
+            jobs = ext.fixture_ramsey_jobs(rig, schedule)
+            bparams = Dict{Symbol,Float64}(
+                Symbol(k) => Float64(v) for (k, v) in believed(rig.twin) if v isa Real)
+            merge!(bparams, Dict{Symbol,Float64}(:detuning_kHz => 20.0))
+            for job in jobs[1:3:end]                     # a stride keeps it quick
+                q_pred = ext._wire_predict_wire(rig, bparams, job.job_wire)
+                acq = ext.run_job(rig.client, job.job_wire)
+                q_true = acq["iq"][1][1]
+                @test [Float64(q_true[1]), Float64(q_true[2])] == collect(q_pred)
+            end
+        finally
+            ext.stop!(rig)
         end
     end
 end

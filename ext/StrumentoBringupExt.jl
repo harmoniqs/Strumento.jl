@@ -55,6 +55,9 @@ using Piccolo
 using Sockets
 
 export RehearsalRig, wire_address, stop!
+export ResonatorSweepDesign, comb_geometry,
+    BringupSchedule, BringupJob, BringupResult, ResonatorSweepFit,
+    propose, run_over_wire, write_back!, run_resonator_sweep, fixture_comb_jobs
 
 include("bringup.jl")
 

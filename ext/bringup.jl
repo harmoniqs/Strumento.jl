@@ -2704,3 +2704,625 @@ end
         end
     end
 end
+
+# ─── The T1 procedure (issue #37, the M4a-3 calibration set) ────────────────────
+#
+# The decay calibration: the ancilla π–delay–measure decay curve over the
+# wire, the exponential fit, and the `T1_q_us` belief entry. The same
+# envelope-ride law as the Ramsey (swept delays are wire-deferred in v1): one
+# payload per delay point, the by-construction π excitation and the in-wave
+# silence gap both inside ONE wave's envelope.
+#
+# THE FIT IS A JUSTIFIED SIBLING of the certification class (the issue's
+# one-fitter-home rule: the certification class where it fits, justified
+# siblings in the same module otherwise), and the justification is exact:
+# for this payload class the response model is a CLOSED FORM. The window is
+# [π excitation, silence]: during the silence the family's Hamiltonian is
+# diagonal on the ancilla (the cavity sits in vacuum — the χ and Kerr terms
+# vanish — and the detuning, when the truth carries one, commutes with
+# populations), so the excited population decays at EXACTLY the ancilla T1
+# rate: p_e(τ) = F·e^(−τ/T1), with F the pulse-end transfer (the flip and its
+# during-pulse decay — τ-independent, a free nuisance). Through the believed
+# readout confusion's second column the measured e-frequency is
+#
+#     q_e(τ) = C₁₂ + (C₂₂ − C₁₂) · F · e^(−τ/T1)
+#
+# with C the BELIEVED confusion (the record's placeholder until the
+# confusion procedure lands its entry — the composed pass runs T1 first,
+# where both are the record's and the form is exact; a re-run after the
+# confusion calibration carries the measured rows, the honest loop). The
+# model is linear in F: the fit profiles F analytically (weighted linear
+# least squares per candidate T1) and golden-sections T1 over a data-anchored
+# bracket. σ(T1) comes from the profiled 2×2 observed information (the same
+# Fisher discipline as the certification class — per-point binomial weights
+# q̂(1−q̂)/shots against the analytic model's numeric Jacobian), the recovery
+# tolerance `BOSONIC_CERT_TOLERANCE_SIGMA`·σ. The exactness is pinned by the
+# testitem: the wire's exact-mode response matches the closed form to the
+# integrator's tolerance on every delay point.
+#
+# THE BELIEF KEY and the record's estimate-flagged placeholder: `T1_q_us` is
+# a belief entry beyond the record's PARAMETER set (the record carries T1 in
+# its NOISE map, wrapped {value, estimate: true, note} — a synthetic
+# typical-of-class PLACEHOLDER nothing could ever replace; the noise map does
+# not enter the twin's belief at instantiate). The procedure's write-back
+# supersedes the placeholder IN BELIEF ONLY — the calibrate! merge lands the
+# measured value in the belief store; the RECORD itself is never edited
+# (records change by vault commit, never by procedure — the twin contract),
+# and the twin's TRUTH keeps rolling on the record's value (decay is a
+# static-from-record device property in v1: drift plans move Hamiltonian
+# truth only — the family builder closes over the record's noise at factory
+# time). The calibration is therefore exact in v1 and the recovery assertion
+# is against the record's value; on a device whose T1 had aged, the belief
+# would carry the measured value while the twin's truth kept the record's —
+# the drift-aware scheduling (M4a-4) is the slice that owns that gap.
+
+"""
+    T1Design(; kwargs...) -> T1Design
+
+The T1 procedure's pinned design — the excitation geometry, the delay grid,
+and the fit's data-anchored bracket parameters.
+
+The excitation: an envelope-authored sin² π pulse of length `T_pi_us` (peak
+drive fraction `probe_gain = 2π/(T_pi_us·1000)`, the comb probe's
+by-construction flip convention) on the ancilla quadratures at the fixed
+carrier `qubit_freq_mhz` (the frame).
+
+The delay grid: `delays_samples` — the swept axis in the wire's lab-native
+unit, ENVELOPE SAMPLES (integer by construction: the decoded axis is exactly
+the declared one). The committed default (9 points, 0..240 μs at the record's
+T1_q_us scale: 0, 20, 40, 60, 90, 120, 160, 200, 240 μs at the rehearsal
+overlay's 12.5 samples/μs) spans the decay's information range (~2·T1).
+
+The fit (the anchor DERIVED from the measured decay, never a hand-picked
+span): the bracket is `[bracket_lo_frac, bracket_hi_frac] ×` T1_anchor, the
+anchor from the measured half-excursion — the first delay whose response
+falls below half the first point's excursion above the believed g-row
+asymptote, T1_anchor = τ_half/ln(2). The analytic model makes the bracket's
+grid cost zero (no model cache: the fit evaluates the closed form), so the
+multipliers straddle generously.
+"""
+struct T1Design
+    T_pi_us::Float64
+    delays_samples::Vector{Int}
+    probe_gain::Float64
+    qubit_freq_mhz::Float64
+    reps::Int
+    soft_avgs::Int
+    bracket_lo_frac::Float64
+    bracket_hi_frac::Float64
+    fit_tol_frac::Float64
+end
+
+function T1Design(; T_pi_us = 4.0,
+                   delays_samples = [0, 250, 500, 750, 1125, 1500, 2000, 2500, 3000],
+                   probe_gain = 2π / (4.0 * 1000.0), qubit_freq_mhz = 4.0,
+                   reps = 50, soft_avgs = 1,
+                   bracket_lo_frac = 0.5, bracket_hi_frac = 2.0,
+                   fit_tol_frac = 1 / 10000)
+    T_pi_us > 0 || error("T1Design: T_pi_us must be > 0 (got $T_pi_us)")
+    probe_gain > 0 || error("T1Design: probe_gain must be > 0 (got $probe_gain)")
+    qubit_freq_mhz > 0 || error(
+        "T1Design: qubit_freq_mhz must be > 0 (got $qubit_freq_mhz)")
+    isempty(delays_samples) && error("T1Design: delays_samples must be non-empty")
+    all(>=(0), delays_samples) || error(
+        "T1Design: delays_samples must be ≥ 0 (the decay's first point is " *
+        "the zero-delay reference)")
+    issorted(delays_samples) || error("T1Design: delays_samples must be sorted")
+    allunique(delays_samples) || error(
+        "T1Design: delays_samples must be unique (the decoded axis steps)")
+    length(delays_samples) ≥ 4 || error(
+        "T1Design: the delay grid needs at least 4 points (the transfer, the " *
+        "decay's flank, its tail, and resolution)")
+    reps ≥ 1 || error("T1Design: reps must be ≥ 1 (got $reps)")
+    soft_avgs ≥ 1 || error("T1Design: soft_avgs must be ≥ 1 (got $soft_avgs)")
+    (0 < bracket_lo_frac < 1 < bracket_hi_frac) || error(
+        "T1Design: the bracket multipliers must straddle the half-excursion " *
+        "anchor (0 < bracket_lo_frac < 1 < bracket_hi_frac; got " *
+        "[$bracket_lo_frac, $bracket_hi_frac])")
+    0 < fit_tol_frac || error("T1Design: fit_tol_frac must be > 0 (got $fit_tol_frac)")
+    return T1Design(Float64(T_pi_us), Int.(delays_samples), Float64(probe_gain),
+        Float64(qubit_freq_mhz), Int(reps), Int(soft_avgs), Float64(bracket_lo_frac),
+        Float64(bracket_hi_frac), Float64(fit_tol_frac))
+end
+
+"""The design's declared delay axis in microseconds (decoded from the wire's
+lab-native envelope samples at the rig's fabric rate)."""
+t1_axis_us(rig::RehearsalRig, design::T1Design) =
+    [s / (rig.soc.dac_rate * 1000.0) for s in design.delays_samples]
+
+"""The design's excitation geometry as the bridge's compile contract (the
+`compile_t1_point` keyword block — the same constants the committed
+fixture-generation script carries)."""
+t1_geometry(design::T1Design) = (
+    T_pi_us = design.T_pi_us,
+    probe_gain = design.probe_gain,
+    qubit_freq_mhz = design.qubit_freq_mhz,
+    reps = design.reps,
+    soft_avgs = design.soft_avgs,
+)
+
+"""The T1 schedule (the `propose_t1` seam's output): the declared delay axis
+(μs, decoded at the rig's fabric rate) and the provenance the supervision
+layer (#38) wraps."""
+struct T1Schedule
+    delays_us::Vector{Float64}
+    provenance::Dict{String,Any}
+end
+
+"""One T1 point's compiled job: its wire payload (the single wave carrying
+the π excitation and the in-wave silence gap) with the accumulated shot
+count."""
+struct T1Job
+    delay_samples::Int
+    job_wire::Dict{String,Any}
+    shots::Int
+end
+
+"""The T1 decay's measured responses (the `run_t1_over_wire` seam's output):
+the schedule, its jobs, the per-point e-outcome frequency on the DECODED
+delay axis, and the rehearsal provenance."""
+struct T1Result
+    schedule::T1Schedule
+    jobs::Vector{T1Job}
+    responses::Vector{Float64}
+    delays_us::Vector{Float64}
+    provenance::Dict{String,Any}
+end
+
+"""The T1 fit's outcome: the fitted T1 (μs) with its derived information
+scale, the 5σ recovery tolerance, the fit quality, the belief-agreement gate
+(against a prior `T1_q_us` belief when one exists — the record's noise
+placeholder does not enter belief, so the first calibration has nothing to
+disagree with), and the rehearsal provenance."""
+struct T1Fit
+    T1_us::Float64
+    T1_sigma_us::Float64
+    T1_tolerance_us::Float64
+    chi2_dof::Float64
+    agrees_with_belief::Bool
+    seed::Any
+    record_id::String
+    provenance::Dict{String,Any}
+end
+
+"""The `propose_t1` seam (#38 wraps here): (belief + schedule) -> the
+declared delay axis, validated. On a RE-CALIBRATION (the belief carries
+`T1_q_us`) the window must reach the believed T1's half-decay
+(`τ_max ≥ ln(2)·T1` — the fit's data anchor is the half-excursion point); the
+first calibration has no believed T1 to reach, and the fit's own
+half-excursion check refuses a window that misses the decay."""
+function propose_t1(rig::RehearsalRig, design::T1Design)
+    delays_us = t1_axis_us(rig, design)
+    prior = get(believed(rig.twin), "T1_q_us", nothing)
+    if prior isa Real
+        T1 = Float64(prior)
+        T1 > 0 || error(
+            "propose_t1: the believed T1_q_us must be > 0 (got $T1) — a decay " *
+            "time is positive")
+        delays_us[end] ≥ log(2) * T1 || error(
+            "propose_t1: the declared delay window [0, $(delays_us[end])] μs does " *
+            "not reach the believed T1's half-decay (ln(2)·T1 ≈ " *
+            "$(round(log(2) * T1; digits = 2)) μs at T1_q_us = $T1) — the belief " *
+            "and the schedule disagree; re-author the grid or recalibrate")
+    end
+    return T1Schedule(
+        delays_us,
+        Dict{String,Any}(
+            "record_id" => rig.twin.record.id,
+            "overlay_id" => rig.overlay_id,
+            "device_path" => rig.device_path,
+            "evidence_class" => "twin-rehearsal",
+        ),
+    )
+end
+
+"""The compile seam's fixture lane: the committed T1 payloads (the Julia-only
+path; the bridge testitem pins the live compile against them bit-exactly)."""
+function fixture_t1_jobs(rig::RehearsalRig, schedule::T1Schedule)
+    fixtures = joinpath(pkgdir(Strumento), "test", "fixtures", "_fixtures")
+    jobs = T1Job[]
+    for i in 1:length(schedule.delays_us)
+        path = joinpath(fixtures, "t1_rehearsal_$(lpad(i - 1, 2, '0')).json")
+        isfile(path) || error(
+            "fixture_t1_jobs: the committed fixture $path is missing — the " *
+            "fixture lane expects one payload per delay point (regenerate with " *
+            "test/fixtures/_fixtures/generate_rehearsal_payloads.py)")
+        job = JSON.parsefile(path)
+        push!(jobs, T1Job(0, job, _job_shots(rig, job)))
+    end
+    return jobs
+end
+
+"""The `run_t1_over_wire` seam (#38 wraps here): run each delay point's
+payload over the wire and reduce to the per-point e-outcome frequency, with
+the same decoded-axis validation as the Ramsey (the payload is the single
+source of truth — the fit's axis is the DECODED one)."""
+function run_t1_over_wire(rig::RehearsalRig, schedule::T1Schedule,
+                          design::T1Design, jobs::Vector{T1Job})
+    js = _jobserver_ext()
+    length(jobs) == length(schedule.delays_us) || error(
+        "run_t1_over_wire: $(length(jobs)) compiled jobs for " *
+        "$(length(schedule.delays_us)) schedule points — one payload per point")
+    n_pi = round(Int, design.T_pi_us * rig.soc.dac_rate * 1000.0)
+    n_pi ≥ 1 || error(
+        "run_t1_over_wire: the excitation geometry T_pi_us = $(design.T_pi_us) " *
+        "decodes to $n_pi envelope samples at the rig's fabric rate — a played " *
+        "pulse must have positive extent")
+    responses = Float64[]
+    delays_us = Float64[]
+    for (i, job) in enumerate(jobs)
+        payload = js.read_payload(rig.server.soccfg, job.job_wire)
+        payload.expts === nothing || error(
+            "run_t1_over_wire: the payload declares an expts axis — the T1 " *
+            "delay axis is the ENVELOPE (one payload per point; a swept delay " *
+            "is wire-deferred in v1 — see the Ramsey section)")
+        length(payload.port_plan) == 1 && length(payload.port_plan[1][2]) == 1 || error(
+            "run_t1_over_wire: the payload plays $(length(payload.port_plan)) " *
+            "generators — the T1 excitation is one ancilla drive wave")
+        wave = payload.waves[payload.port_plan[1][2][1]]
+        nsamp = wave.length_cycles * payload.gen_cfg[payload.port_plan[1][1]].samps_per_clk
+        delay_samples = nsamp - n_pi
+        delay_samples == design.delays_samples[i] || error(
+            "run_t1_over_wire: the design's declared delay " *
+            "$(design.delays_samples[i]) samples does not match the payload's " *
+            "decoded gap ($delay_samples samples, wave length $nsamp = " *
+            "$n_pi pulse + gap) — compile the design's own grid (the bridge " *
+            "lane) or re-author the design to the committed geometry")
+        acq = run_job(rig.client, job.job_wire)
+        iq = get(acq, "iq", nothing)
+        (iq isa AbstractVector && length(iq) == 1 && length(iq[1]) == 1 &&
+         length(iq[1][1]) == 2) || error(
+            "run_t1_over_wire: the per-point acquisition must be one read's " *
+            "(I, Q) pair (the twin's v1 one-readout response)")
+        push!(responses, Float64(iq[1][1][2]))
+        push!(delays_us, delay_samples / (rig.soc.dac_rate * 1000.0))
+    end
+    return T1Result(schedule, jobs, responses, delays_us,
+        Dict{String,Any}(
+            "schedule_provenance" => schedule.provenance,
+            "evidence_class" => "twin-rehearsal",
+            "seed" => rig.seed,
+            "overlay_id" => rig.overlay_id,
+            "twin_time_days" => rig.twin.t,
+        ))
+end
+
+# The T1 sibling fit's closed form (the justified sibling — see the section
+# docstring): q_e(τ) = c₁ + (c₂ − c₁)·F·e^(−τ/T1), evaluated per delay point
+# on the DECODED axis. c₁, c₂ are the believed confusion's second-column
+# entries (the g-row and e-row e-outcome frequencies).
+function _t1_model(c1::Real, c2::Real, F::Real, T1::Real, τ::AbstractVector)
+    return [c1 + (c2 - c1) * F * exp(-t / T1) for t in τ]
+end
+
+"""The `fit_t1` seam (#38 wraps here): the JUSTIFIED SIBLING of the
+certification class — the exponential fit (weighted binomial χ² of the
+measured decay against the closed-form response model, see the section
+docstring), the transfer F profiled analytically per candidate T1, golden
+section over the data-anchored bracket, σ(T1) from the profiled 2×2 observed
+information (the same Fisher discipline), the recovery tolerance
+`BOSONIC_CERT_TOLERANCE_SIGMA`·σ."""
+function fit_t1(rig::RehearsalRig, design::T1Design, result::T1Result)
+    pc = _piccolo_ext()
+    belief = believed(rig.twin)
+    # the believed confusion's second column (the record's placeholder until
+    # the confusion procedure lands its entry — one read path, the cert
+    # machinery's own belief-side confusion reader)
+    C = pc._cert_belief_confusion(rig.twin)
+    size(C) == (2, 2) || error(
+        "fit_t1: the believed readout confusion is $(size(C)) — the T1 " *
+        "response model serves the 2-outcome ancilla readout")
+    c1, c2 = C[1, 2], C[2, 2]
+    c2 > c1 || error(
+        "fit_t1: the believed confusion's e-outcome column is monotone " *
+        "(C₁₂ = $c1 ≥ C₂₂ = $c2) — the decay contrast is negative; the belief's " *
+        "readout confusion is inconsistent with an excited-state decay")
+    n = length(result.responses)
+    n == length(result.delays_us) || error(
+        "fit_t1: $(n) measured responses on a $(length(result.delays_us))-point " *
+        "axis — one response per decoded delay point")
+    shots = unique([job.shots for job in result.jobs])
+    length(shots) == 1 || error(
+        "fit_t1: the schedule's payloads carry different accumulated shot " *
+        "counts ($(shots)) — the fit's binomial weights need one count")
+    shots[1] ≥ 1 || error("fit_t1: the accumulated shot count must be ≥ 1")
+    N = shots[1]
+
+    τ = result.delays_us
+    y = result.responses
+    σ² = [max(q * (1 - q), 1e-9) / N for q in y]     # the measured binomial variances
+
+    # the data anchor: the measured half-excursion — the first delay whose
+    # response falls below half the FIRST point's excursion above the
+    # believed g-row asymptote (τ = 0 is the transfer reference; the
+    # excursion above c₁ decays as e^(−τ/T1))
+    y0 = y[1] - c1
+    y0 > 0 || error(
+        "fit_t1: the measured response at the first delay sits at or below " *
+        "the believed g-row asymptote (q̂ = $(y[1]) vs C₁₂ = $c1) — no decay " *
+        "excursion to fit; is the excitation landing?")
+    k_half = findfirst(k -> y[k] - c1 < y0 / 2, 1:n)
+    k_half === nothing && error(
+        "fit_t1: the measured decay never halves its excursion within the " *
+        "declared window [0, $(τ[end])] μs — the delay grid does not reach the " *
+        "decay's half-time; re-author the grid")
+    # interpolate the half-excursion crossing between the bracketing points
+    frac = ((y[k_half - 1] - c1) - y0 / 2) / ((y[k_half - 1] - c1) - (y[k_half] - c1))
+    frac = clamp(frac, 0.0, 1.0)     # the crossing sits between the bracketing points
+    τ_half = τ[k_half - 1] + frac * (τ[k_half] - τ[k_half - 1])
+    anchor_us = τ_half / log(2)
+    lo = design.bracket_lo_frac * anchor_us
+    hi = design.bracket_hi_frac * anchor_us
+    fit_tol = design.fit_tol_frac * anchor_us
+
+    # χ²(T1) with the transfer profiled analytically: the model is LINEAR in
+    # the contrast-absorbed transfer G = (C₂₂−C₁₂)·F (q_e = C₁₂ + G·x), so
+    # per candidate T1 the weighted linear least squares Ĝ is closed-form
+    function chi2_profiled(T1)
+        T1 > 0 || return Inf, 0.0
+        x = [exp(-t / T1) for t in τ]
+        sw = sum(x[k]^2 / σ²[k] for k in 1:n)
+        sw > 0 || return Inf, 0.0
+        Ĝ = sum(x[k] * (y[k] - c1) / σ²[k] for k in 1:n) / sw
+        return sum((y[k] - (c1 + Ĝ * x[k]))^2 / σ²[k] for k in 1:n), Ĝ
+    end
+    gr = (sqrt(5) - 1) / 2
+    a, b = lo, hi
+    c = b - gr * (b - a); d = a + gr * (b - a)
+    fc = first(chi2_profiled(c)); fd = first(chi2_profiled(d))
+    while (b - a) > fit_tol
+        if fc < fd
+            b, d, fd = d, c, fc
+            c = b - gr * (b - a); fc = first(chi2_profiled(c))
+        else
+            a, c, fc = c, d, fd
+            d = a + gr * (b - a); fd = first(chi2_profiled(d))
+        end
+    end
+    T̂1 = (a + b) / 2
+    chi2min, Ĝ = chi2_profiled(T̂1)
+    # the reported transfer is the pulse-end population F (the contrast-
+    # absorbed G unwound through the believed confusion's column contrast)
+    F̂ = Ĝ / (c2 - c1)
+
+    # the profiled 2×2 observed information at the optimum: the analytic
+    # model's numeric Jacobian against the measured binomial variances (in
+    # the G parameterization — the marginal σ(T1) is invariant to the
+    # nuisance's scale), the marginal σ(T1) from the inverse Fisher's T1
+    # entry (the nuisance profiled out by the 2×2 marginal)
+    m(δG, δT) = [(c1 + (Ĝ + δG) * exp(-t / (T̂1 + δT))) for t in τ]
+    ε = max(1e-6 * Ĝ, 1e-12)
+    dG = (m(ε, 0.0) .- m(-ε, 0.0)) ./ (2ε)
+    εT = max(1e-6 * T̂1, 1e-12)
+    dT = (m(0.0, εT) .- m(0.0, -εT)) ./ (2εT)
+    IGG = sum(dG .^ 2 ./ σ²)
+    ITT = sum(dT .^ 2 ./ σ²)
+    IGT = sum(dG .* dT ./ σ²)
+    det = IGG * ITT - IGT^2
+    σ_T1 = det > 0 ? sqrt(IGG / det) : Inf
+
+    tolerance = pc.BOSONIC_CERT_TOLERANCE_SIGMA * σ_T1
+    dof = max(n - 2, 1)
+    prior = get(belief, "T1_q_us", nothing)
+    agrees = !(prior isa Real) || abs(T̂1 - Float64(prior)) ≤ tolerance
+    return T1Fit(T̂1, σ_T1, tolerance, chi2min / dof, agrees,
+        result.provenance["seed"], rig.twin.record.id,
+        Dict{String,Any}(
+            "record_id" => rig.twin.record.id,
+            "record_path" => rig.record_path,
+            "design" => "$(n) delay points x $(N) shots; bracket " *
+                        "[$(round(lo; digits=2)), $(round(hi; digits=2))] μs " *
+                        "(half-excursion at $(round(τ_half; digits=2)) μs)",
+            "transfer_F" => F̂,
+            "tolerance_rule" => string(
+                "recovery within $(pc.BOSONIC_CERT_TOLERANCE_SIGMA)·σ; σ(T1) from " *
+                "the profiled 2×2 observed binomial information (the analytic " *
+                "decay model's Jacobian vs q̂(1−q̂)/N, the transfer F " *
+                "profiled analytically)"),
+            "evidence_class" => "twin-rehearsal",
+            "tool" => "Strumento v$(pkgversion(Strumento)), julia $(VERSION)",
+        ))
+end
+
+"""The `write_back` seam (#38 wraps here): the fitted T1 lands in the twin's
+BELIEF via `calibrate!` — never truth, and never the record: the record's
+noise.T1_q_us is an estimate-flagged PLACEHOLDER the twin keeps rolling on
+(the family builder closes over the record's noise at factory time; decay is
+a static-from-record device property in v1). The entry supersedes the
+placeholder IN BELIEF ONLY — records change by vault commit, never by
+procedure."""
+function write_back!(rig::RehearsalRig, fitres::T1Fit)
+    calibrate!(rig.twin, Dict{String,Any}("T1_q_us" => fitres.T1_us))
+    return rig
+end
+
+"""
+    run_t1_sweep(rig, design; jobs = fixture_t1_jobs) -> T1Fit
+
+The T1 chain, one call: propose → compile → run over the wire → fit → write
+back. `jobs` is the compile seam's source: the committed fixture payloads
+(the default — the Julia-only lane) or a live bridge source (the PythonCall
+extension's `compile_t1_point` over the design's `t1_geometry`, one payload
+per delay point).
+
+Everything is a pure function of (rig, design, jobs, the twin's seed): a
+procedure run replays bit-exactly from its seed across fresh processes (the
+replay check: `test/configurations/calibration_replay_check.jl`).
+"""
+function run_t1_sweep(rig::RehearsalRig, design::T1Design; jobs = fixture_t1_jobs)
+    schedule = propose_t1(rig, design)
+    payloads = jobs isa Function ? jobs(rig, schedule) : jobs
+    result = run_t1_over_wire(rig, schedule, design, payloads)
+    fitres = fit_t1(rig, design, result)
+    write_back!(rig, fitres)
+    return fitres
+end
+
+@testitem "the T1 procedure recovers the decay time through the wire within the DERIVED tolerance (the belief supersedes the record's placeholder)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (bring-up extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        using Strumento: DriftPlan, instantiate, believed, advance!, calibrate!,
+                         OrnsteinUhlenbeck
+        ext = Base.get_extension(Strumento, :StrumentoBringupExt)
+
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        record = joinpath(fixtures, "twins", "bosonic.md")
+        device = joinpath(fixtures, "multimode_rehearsal", "device.yaml")
+        soccfg = joinpath(fixtures, "multimode_rehearsal", "soccfg_v2_rehearsal.json")
+        wiring = TwinWiringMap([
+            TwinGenWiring(2, 1, 2; line = "qubit.drive"),
+            TwinGenWiring(3, 3, 4; line = "manipulate.main"),
+        ]; n_drives = 4)
+
+        # a DRIFTED twin (the rehearsal posture): the drift moves Hamiltonian
+        # truth only — the record's T1 (the noise placeholder the twin's decay
+        # actually rolls on, a static-from-record device property in v1) is
+        # what the procedure must recover.
+        plan = DriftPlan(:chi_kHz => [OrnsteinUhlenbeck(theta = 0.07, sigma = 3.0,
+                                                        mu = -298.4)])
+        make_rig(seed) = ext.RehearsalRig(record, device, soccfg, wiring;
+                                         drift = plan, seed = seed,
+                                         overlay_id = "rehearsal-v2")
+        rig = make_rig(0xC0FFEE)
+        try
+            advance!(rig.twin, 3.0)
+            truth_chi = rig.twin.truth[:chi_kHz]
+            n_truth = length(rig.twin.truth)
+            T1_record = rig.twin.record.noise["T1_q_us"]["value"]
+            design = ext.T1Design()
+
+            # the record's noise placeholder is ESTIMATE-flagged, and it does
+            # NOT enter the twin's belief (instantiate seeds belief with the
+            # record's PARAMETERS only) — nothing has ever superseded it
+            @test rig.twin.record.noise["T1_q_us"]["estimate"] == true
+            @test !haskey(believed(rig.twin), "T1_q_us")
+
+            fitres = ext.run_t1_sweep(rig, design)   # propose -> wire -> fit -> write back
+
+            # ── the fit is REAL and recovers the record's T1 (the value the
+            # twin's decay rolls on, static in v1) within the DERIVED
+            # tolerance (never a hand-picked one): 5·σ, σ from the profiled
+            # observed information
+            pc = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+            @test fitres.T1_us !== nothing
+            @test abs(fitres.T1_us - T1_record) < fitres.T1_tolerance_us
+            @test fitres.T1_tolerance_us ≈ pc.BOSONIC_CERT_TOLERANCE_SIGMA *
+                                        fitres.T1_sigma_us
+            @test 1e-3 < fitres.T1_sigma_us < 5.0   # a real information scale (μs)
+            # the fit is a real procedure, not a restatement of the record:
+            # the estimate sits off the truth (shot noise) with a sound residual
+            @test fitres.T1_us != T1_record
+            @test 0.1 < fitres.chi2_dof < 4.0
+
+            # the belief-agreement flag is its DEFINITION: with no prior T1
+            # belief (the record's noise placeholder never entered belief)
+            # there is nothing to disagree with
+            @test fitres.agrees_with_belief
+
+            # ── the write-back supersedes the record's estimate-flagged
+            # placeholder IN BELIEF ONLY: the belief entry lands via
+            # calibrate!, the RECORD is untouched, and the twin's truth keeps
+            # rolling on the record's value
+            @test believed(rig.twin)["T1_q_us"] == fitres.T1_us
+            @test rig.twin.record.noise["T1_q_us"]["value"] == T1_record
+            @test rig.twin.record.noise["T1_q_us"]["estimate"] == true
+            # T1_q_us is a BELIEF key beyond the record's parameter set (the
+            # noise map never entered belief); truth keys untouched
+            @test length(believed(rig.twin)) == 8       # the record's 7 + T1
+            @test length(rig.twin.truth) == n_truth
+            @test !any(==(Symbol("T1_q_us")), keys(rig.twin.truth))
+            @test rig.twin.truth[:chi_kHz] == truth_chi
+
+            # drift moves truth ONLY: aging the twin leaves the calibrated
+            # belief exactly where the write-back put it
+            advance!(rig.twin, 1.0)
+            @test believed(rig.twin)["T1_q_us"] == fitres.T1_us
+            @test rig.twin.truth[:chi_kHz] != truth_chi
+
+            # the rehearsal evidence marking: twin-rehearsal, never device results
+            @test fitres.provenance["evidence_class"] == "twin-rehearsal"
+            @test fitres.seed == 0xC0FFEE
+            @test fitres.record_id == rig.twin.record.id
+
+            # ── a RE-CALIBRATION against the prior belief: the second run's
+            # agrees_with_belief is computed against the written-back entry
+            fit2 = ext.run_t1_sweep(rig, design)
+            @test fit2.agrees_with_belief ==
+                  (abs(fit2.T1_us - fitres.T1_us) ≤ fit2.T1_tolerance_us)
+            @test fit2.agrees_with_belief          # a sound recalibration agrees
+
+            # ── the propose seam's belief/schedule validation: once the belief
+            # carries T1, a window that cannot reach its half-decay is refused
+            err = try
+                ext.propose_t1(rig, ext.T1Design(delays_samples = [0, 100, 200, 300]));
+                nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("half-decay", sprint(showerror, err))
+
+            # ── the run seam's decoded-axis refusal: a declared grid that
+            # differs from the payloads the wire actually runs is refused
+            err = try
+                ext.run_t1_sweep(rig, ext.T1Design(
+                    delays_samples = [0, 200, 400, 600, 800, 1200, 1600, 2000, 2400]));
+                nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("does not match", sprint(showerror, err))
+        finally
+            ext.stop!(rig)
+        end
+
+        # ── the exactness pin (the sibling's justification): through the wire
+        # in EXACT mode (belief == truth, no detuning — the degenerate frame),
+        # the closed form predicts every delay point's response to the
+        # integrator's tolerance: F from the zero-delay point, then the decay
+        # at the record's T1 — the response model is EXACTLY exponential
+        # (the justification for the sibling fit class, pinned)
+        rig_x = ext.RehearsalRig(record, device, soccfg, wiring;
+                                 drift = DriftPlan(), seed = 0xC0FFEE,
+                                 overlay_id = "rehearsal-v2", exact = true)
+        try
+            schedule = ext.propose_t1(rig_x, ext.T1Design())
+            jobs = ext.fixture_t1_jobs(rig_x, schedule)
+            result = ext.run_t1_over_wire(rig_x, schedule, ext.T1Design(), jobs)
+            C = rig_x.twin.record.noise["readout_confusion"]["value"]
+            c1, c2 = C[1][2], C[2][2]
+            T1 = rig_x.twin.record.noise["T1_q_us"]["value"]
+            F = (result.responses[1] - c1) / (c2 - c1)
+            for k in 1:length(result.delays_us)
+                model = c1 + (c2 - c1) * F * exp(-result.delays_us[k] / T1)
+                @test result.responses[k] ≈ model atol = 1e-5
+            end
+        finally
+            ext.stop!(rig_x)
+        end
+
+        # ── seeded replay, in-process form: two FRESH rigs with the same seed
+        # reproduce the whole procedure bit-exactly; a different seed differs
+        run_it(seed) = begin
+            r = make_rig(seed)
+            try
+                advance!(r.twin, 3.0)
+                ext.run_t1_sweep(r, ext.T1Design())
+            finally
+                ext.stop!(r)
+            end
+        end
+        a = run_it(0x5EED)
+        b = run_it(0x5EED)
+        c = run_it(0xFEED)
+        @test a.T1_us == b.T1_us && a.T1_sigma_us == b.T1_sigma_us
+        @test a.T1_us != c.T1_us
+    end
+end

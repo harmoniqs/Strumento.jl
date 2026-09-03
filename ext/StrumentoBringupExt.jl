@@ -65,6 +65,9 @@ export RamseyDesign, ramsey_axis_us, ramsey_geometry,
     RamseySchedule, RamseyJob, RamseyResult, RamseyFit,
     propose_ramsey, run_ramsey_over_wire, fit_ramsey, run_ramsey_sweep,
     fixture_ramsey_jobs
+export T1Design, t1_axis_us, t1_geometry,
+    T1Schedule, T1Job, T1Result, T1Fit,
+    propose_t1, run_t1_over_wire, fit_t1, run_t1_sweep, fixture_t1_jobs
 
 include("bringup.jl")
 

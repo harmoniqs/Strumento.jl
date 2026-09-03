@@ -73,6 +73,9 @@ const BASE_SURFACE = [
     # the soc contract
     :AbstractSoc, :execute!, :load_envelope!, :play_program!, :acquire,
     :dac_rate, :adc_rate,
+    # the DC control class (the soc contract's slow-DC sibling, issue #35)
+    :set_gate!, :get_gate, :gate_snapshot,
+    :DCAxis, :DCAxisMap,
     # the channel map (device policy) + the twin wiring (the bring-up rung, issue #31)
     :QickChannelMap, :QickGenChannel,
     :TwinWiringMap, :TwinGenWiring, :wiring_for,

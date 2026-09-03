@@ -20,9 +20,11 @@ relocated to Intonato (≥ its next release, which depends on this package); the
 instrument layer no longer knows the calibration loop.
 
 **Dependency-light by construction (issue #16):** the base package carries only the
-contract surface — the `AbstractSoc` abstraction and its verbs, the `QickChannelMap`
-device policy, readout conversion, the `QickProgram` translation record — plus the
-twin core, over stdlib and light deps only. Piccolo and PythonCall are package
+contract surface — the `AbstractSoc` abstraction and its verbs (the waveform family
+`execute!`/`acquire` AND the slow-DC control class `set_gate!`/`get_gate`/`gate_snapshot`
+— gate voltages are CONTROLS, the autotuner's actions, never truth and never waveforms),
+the `QickChannelMap` device policy, the `DCAxisMap` DC wiring, readout conversion, the
+`QickProgram` translation record — plus the twin core, over stdlib and light deps only. Piccolo and PythonCall are package
 *extensions* (weakdeps): the Piccolo-triggered extension (`StrumentoPiccoloExt`)
 carries the mock soc and the pulse → QICK-envelope translation; the
 PythonCall-triggered extension (`StrumentoPythonCallExt`) carries the Python
@@ -47,6 +49,7 @@ using TestItems
 # ──── SoC abstraction ────────────────────────────────────────────────────────
 include("soc.jl")
 include("channel_map.jl")
+include("dc.jl")
 
 # ──── Pulse / readout translation ────────────────────────────────────────────
 # The QickProgram data contract + the duck-typed translation verb live in base;
@@ -72,7 +75,9 @@ include("twin.jl")
 # surface on the parent module.
 export AbstractSoc
 export execute!, load_envelope!, play_program!, acquire, dac_rate, adc_rate
+export set_gate!, get_gate, gate_snapshot
 export QickChannelMap, QickGenChannel
+export DCAxis, DCAxisMap, gate_names, axis_for
 export TwinWiringMap, TwinGenWiring, wiring_for
 export pulse_to_envelopes, QickProgram
 export iq_to_measurements, Measurement

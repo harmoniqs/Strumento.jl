@@ -2340,9 +2340,12 @@ end
 
 # The belief-side wire model over a raw wire payload (the `_wire_predict`
 # body, split so the Ramsey jobs — which are not BringupJobs — share it; the
-# comb's original signature is a thin wrapper, unchanged).
-function _wire_predict_wire(rig::RehearsalRig, params::Dict{Symbol,Float64},
-                            job_wire::AbstractDict)
+# comb's original signature is a thin wrapper, unchanged). The MARGINAL
+# form (`_wire_marginal_wire`) returns the pre-confusion measurement vector
+# — the confusion procedure's survive factor reads it (the pulse-end
+# transfer, before the readout remap).
+function _wire_marginal_wire(rig::RehearsalRig, params::Dict{Symbol,Float64},
+                             job_wire::AbstractDict)
     js = _jobserver_ext()
     payload = js.read_payload(rig.server.soccfg, job_wire)
     drives = js.translate_drive(payload)
@@ -2360,17 +2363,32 @@ function _wire_predict_wire(rig::RehearsalRig, params::Dict{Symbol,Float64},
     recon = LinearSplinePulse(ctrls, times)
 
     # the family system at the CANDIDATE (belief-side) parameters — the fit
-    # never sees the twin's truth — with the soc's own confusion (the record's
-    # readout model) and the soc's own remap arithmetic (the degenerate
-    # belief == truth case must reproduce the server's exact response
-    # BIT-for-bit, and the two accumulation orders differ in the last ulp).
+    # never sees the twin's truth; the same rollout and measurement the soc
+    # performs. Returns the PRE-confusion measurement vector (the marginal).
     system = rig.families[rig.twin.record.family](params)
     ψ = rig.soc.ψ_init
     ρ0 = ψ * ψ'
     qtraj = DensityTrajectory(system, recon, ρ0, ρ0)
-    p = rig.measurement_fn(Piccolo.density_to_iso_vec(qtraj(times[end])))
+    return rig.measurement_fn(Piccolo.density_to_iso_vec(qtraj(times[end])))
+end
+
+# the confused (outcome-frequency) form: the marginal remapped by the soc's
+# own confusion (the record's readout model), with the soc's own remap
+# arithmetic (`_respond`'s explicit sum, not a BLAS product): the degenerate
+# belief == truth case must reproduce the server's exact response
+# BIT-for-bit, and the two accumulation orders differ in the last ulp.
+function _wire_confused_wire(rig::RehearsalRig, p::AbstractVector{<:Real})
     confusion = _piccolo_ext()._record_confusion(rig.twin)
     return [sum(confusion[i, j] * p[i] for i in eachindex(p)) for j in eachindex(p)]
+end
+
+# the full belief-side wire prediction over a raw payload: the marginal rolled
+# at the candidate parameters, then the confusion remap (the `_wire_predict`
+# body, split so the calibration-set jobs — which are not BringupJobs — share
+# it; the comb's original signature is a thin wrapper, unchanged).
+function _wire_predict_wire(rig::RehearsalRig, params::Dict{Symbol,Float64},
+                            job_wire::AbstractDict)
+    return _wire_confused_wire(rig, _wire_marginal_wire(rig, params, job_wire))
 end
 
 """The `fit_ramsey` seam (#38 wraps here): the certification fit class —
@@ -3324,5 +3342,487 @@ end
         c = run_it(0xFEED)
         @test a.T1_us == b.T1_us && a.T1_sigma_us == b.T1_sigma_us
         @test a.T1_us != c.T1_us
+    end
+end
+
+# ─── The confusion procedure (issue #37, the M4a-3 calibration set) ─────────────
+#
+# The readout-confusion calibration: prepare the ancilla's ground and excited
+# states, count through the response machinery, and recover the confusion
+# matrix from the counts' statistics — the "measured confusion" the
+# certification transfer procedure consumes, until now produced by no
+# procedure. The two preparations ride the same envelope-ride wire form:
+# the g-prep is a zero-drive window (the ancilla starts and stays in |g,0⟩
+# — the rig's initial state), the e-prep is the by-construction π excitation
+# of `T_pi_us`.
+#
+# THE COUNTS ARE THE TWIN'S CONFUSION ACTING: the soc's response is the
+# record's confusion remap of the ancilla marginal, shot-sampled — the
+# g-prep's outcome frequency IS the confusion's first row (nothing can relax
+# the ground state), and the e-prep's counts are the second row MIXED
+# through the excitation's imperfection and its during-window decay:
+#
+#     q_e-prep = (1 − F)·row₁ + F·row₂
+#
+# with F the pulse-end excited population (the flip, its during-pulse decay,
+# and the envelope's quantization — the whole payload-window transfer). The
+# row-2 recovery inverts this exactly, and the survive factor F is the
+# PAYLOAD-DRIVEN ROLLOUT's excited marginal at the window's end (the
+# belief-side model, one rollout — the same discipline every fit here rides:
+# the model must predict exactly what the server executes). This deviates
+# from the certification machinery's state-prep precedent
+# (`estimate_readout_confusion`, whose survive factor is the analytic
+# e^(−γT) because its e-preparation IS the soc's initial state with no
+# pulse): a PULSE preparation's F is not e^(−γT) — the flip competes with
+# the during-pulse decay — and the analytic form under-corrects by the
+# difference; the rollout's marginal is exact.
+#
+# THE DERIVED BOUNDS (never hand-picked): each entry's standard error comes
+# from the counts' own binomial statistics — row₁ directly
+# (q̂(1−q̂)/shots per entry), row₂ through the correction's error
+# propagation (the row₁ variance riding the (1−F) term plus the counts'
+# variance, over F²) — and the recovery claim is the 5σ discipline
+# (`BOSONIC_CERT_TOLERANCE_SIGMA`·σ per entry).
+#
+# THE BELIEF KEY: `readout_confusion`, in the vault's WRAPPED noise form
+# {value, estimate: false, note} (the `BosonicCalibration` write-back
+# precedent) — the exact form the certification machinery's belief-side
+# confusion reader (`_cert_belief_confusion`) consumes, so the measured
+# matrix the transfer procedure reads is now produced by a procedure. The
+# record's own noise.readout_confusion (estimate-flagged placeholder) is
+# never edited; the twin's v1 truth keeps rolling on it (the soc unwraps the
+# record's noise — a static-from-record device property).
+
+"""
+    ConfusionDesign(; kwargs...) -> ConfusionDesign
+
+The confusion procedure's pinned design — the e-prep excitation geometry
+(the g-prep rides the same window with zero drive).
+
+The e-prep: an envelope-authored sin² π pulse of length `T_pi_us` (peak drive
+fraction `probe_gain = 2π/(T_pi_us·1000)`, the comb probe's by-construction
+flip convention) on the ancilla quadratures at the fixed carrier
+`qubit_freq_mhz` (the frame). The window is the pulse — the measure reads at
+the drive's end, and the counts' during-window decay is exactly the pulse
+plus nothing.
+"""
+struct ConfusionDesign
+    T_pi_us::Float64
+    probe_gain::Float64
+    qubit_freq_mhz::Float64
+    reps::Int
+    soft_avgs::Int
+end
+
+function ConfusionDesign(; T_pi_us = 4.0, probe_gain = 2π / (4.0 * 1000.0),
+                          qubit_freq_mhz = 4.0, reps = 50, soft_avgs = 1)
+    T_pi_us > 0 || error("ConfusionDesign: T_pi_us must be > 0 (got $T_pi_us)")
+    probe_gain > 0 || error(
+        "ConfusionDesign: probe_gain must be > 0 (got $probe_gain)")
+    qubit_freq_mhz > 0 || error(
+        "ConfusionDesign: qubit_freq_mhz must be > 0 (got $qubit_freq_mhz)")
+    reps ≥ 1 || error("ConfusionDesign: reps must be ≥ 1 (got $reps)")
+    soft_avgs ≥ 1 || error("ConfusionDesign: soft_avgs must be ≥ 1 (got $soft_avgs)")
+    return ConfusionDesign(Float64(T_pi_us), Float64(probe_gain),
+        Float64(qubit_freq_mhz), Int(reps), Int(soft_avgs))
+end
+
+"""The design's preparation geometry as the bridge's compile contract (the
+`compile_confusion_points` keyword block — the same constants the committed
+fixture-generation script carries)."""
+confusion_geometry(design::ConfusionDesign) = (
+    T_pi_us = design.T_pi_us,
+    probe_gain = design.probe_gain,
+    qubit_freq_mhz = design.qubit_freq_mhz,
+    reps = design.reps,
+    soft_avgs = design.soft_avgs,
+)
+
+"""The confusion schedule (the `propose_confusion` seam's output): the two
+preparations and the provenance the supervision layer (#38) wraps."""
+struct ConfusionSchedule
+    preparations::Vector{String}
+    provenance::Dict{String,Any}
+end
+
+"""The confusion procedure's compiled jobs: the two preparation payloads
+(ground, excited) with their shared accumulated shot count."""
+struct ConfusionJobs
+    g_wire::Dict{String,Any}
+    e_wire::Dict{String,Any}
+    shots::Int
+end
+
+"""The confusion procedure's measured counts (the `run_confusion_over_wire`
+seam's output): the two preparations' outcome-frequency vectors — the
+counts ARE the twin's confusion acting — with the schedule and the
+rehearsal provenance."""
+struct ConfusionResult
+    schedule::ConfusionSchedule
+    jobs::ConfusionJobs
+    q_ground::Vector{Float64}
+    q_excited::Vector{Float64}
+    shots::Int
+    provenance::Dict{String,Any}
+end
+
+"""The confusion fit's outcome: the recovered 2×2 confusion matrix (rows =
+TRUE state outcome distributions, the record's convention) with its
+PER-ENTRY derived standard errors (the counts' binomial statistics,
+row₂ through the correction's error propagation), the survive factor F the
+row-2 recovery unwound, the belief-agreement gate, and the rehearsal
+provenance."""
+struct ConfusionFit
+    confusion::Matrix{Float64}
+    sigma::Matrix{Float64}
+    survive_F::Float64
+    agrees_with_belief::Bool
+    seed::Any
+    record_id::String
+    provenance::Dict{String,Any}
+end
+
+"""The `propose_confusion` seam (#38 wraps here): (belief + schedule) -> the
+two preparations. The confusion procedure has no swept axis to validate
+against the belief; the seam exists for the #38 wrap and the provenance."""
+function propose_confusion(rig::RehearsalRig, design::ConfusionDesign)
+    return ConfusionSchedule(
+        ["ground", "excited"],
+        Dict{String,Any}(
+            "record_id" => rig.twin.record.id,
+            "overlay_id" => rig.overlay_id,
+            "device_path" => rig.device_path,
+            "evidence_class" => "twin-rehearsal",
+        ),
+    )
+end
+
+"""The compile seam's fixture lane: the committed confusion payloads (the
+Julia-only path; the bridge testitem pins the live compile against them
+bit-exactly)."""
+function fixture_confusion_jobs(rig::RehearsalRig, schedule::ConfusionSchedule)
+    fixtures = joinpath(pkgdir(Strumento), "test", "fixtures", "_fixtures")
+    gpath = joinpath(fixtures, "confusion_g_rehearsal.json")
+    epath = joinpath(fixtures, "confusion_e_rehearsal.json")
+    for path in (gpath, epath)
+        isfile(path) || error(
+            "fixture_confusion_jobs: the committed fixture $path is missing — " *
+            "the fixture lane expects the two confusion preparation payloads " *
+            "(regenerate with test/fixtures/_fixtures/generate_rehearsal_payloads.py)")
+    end
+    g_wire = JSON.parsefile(gpath)
+    e_wire = JSON.parsefile(epath)
+    return ConfusionJobs(g_wire, e_wire, _job_shots(rig, e_wire))
+end
+
+"""The `run_confusion_over_wire` seam (#38 wraps here): run both preparation
+payloads over the wire and keep each read's outcome-frequency pair. The
+payload is validated per the procedure's shape (one played ancilla drive
+wave, no sweep, the decoded window equal to the declared geometry — the
+same decoded-axis discipline as the Ramsey/T1)."""
+function run_confusion_over_wire(rig::RehearsalRig, schedule::ConfusionSchedule,
+                                 design::ConfusionDesign, jobs::ConfusionJobs)
+    js = _jobserver_ext()
+    n_pi = round(Int, design.T_pi_us * rig.soc.dac_rate * 1000.0)
+    n_pi ≥ 1 || error(
+        "run_confusion_over_wire: the excitation geometry T_pi_us = " *
+        "$(design.T_pi_us) decodes to $n_pi envelope samples at the rig's " *
+        "fabric rate — a played pulse must have positive extent")
+    function read_counts(wire)
+        payload = js.read_payload(rig.server.soccfg, wire)
+        payload.expts === nothing || error(
+            "run_confusion_over_wire: the payload declares an expts axis — the " *
+            "confusion preparations are fixed points")
+        length(payload.port_plan) == 1 && length(payload.port_plan[1][2]) == 1 || error(
+            "run_confusion_over_wire: the payload plays " *
+            "$(length(payload.port_plan)) generators — the confusion " *
+            "preparations are one ancilla drive wave each")
+        wave = payload.waves[payload.port_plan[1][2][1]]
+        nsamp = wave.length_cycles *
+                payload.gen_cfg[payload.port_plan[1][1]].samps_per_clk
+        nsamp == n_pi || error(
+            "run_confusion_over_wire: the payload's decoded window " *
+            "($nsamp samples) does not match the design's declared geometry " *
+            "($n_pi samples at T_pi_us = $(design.T_pi_us)) — compile the " *
+            "design's own payloads (the bridge lane) or re-author the design " *
+            "to the committed geometry")
+        acq = run_job(rig.client, wire)
+        iq = get(acq, "iq", nothing)
+        (iq isa AbstractVector && length(iq) == 1 && length(iq[1]) == 1 &&
+         length(iq[1][1]) == 2) || error(
+            "run_confusion_over_wire: the per-preparation acquisition must be " *
+            "one read's (I, Q) pair (the twin's v1 one-readout response)")
+        return [Float64(iq[1][1][1]), Float64(iq[1][1][2])]
+    end
+    q_ground = read_counts(jobs.g_wire)
+    q_excited = read_counts(jobs.e_wire)
+    shots_g = _job_shots(rig, jobs.g_wire)
+    shots_e = _job_shots(rig, jobs.e_wire)
+    shots_g == shots_e == jobs.shots || error(
+        "run_confusion_over_wire: the two preparations carry different " *
+        "accumulated shot counts (g: $shots_g, e: $shots_e, schedule: " *
+        "$(jobs.shots)) — the recovery's binomial bounds need one count")
+    return ConfusionResult(schedule, jobs, q_ground, q_excited, jobs.shots,
+        Dict{String,Any}(
+            "schedule_provenance" => schedule.provenance,
+            "evidence_class" => "twin-rehearsal",
+            "seed" => rig.seed,
+            "overlay_id" => rig.overlay_id,
+            "twin_time_days" => rig.twin.t,
+        ))
+end
+
+"""The `fit_confusion` seam (#38 wraps here): the recovery — row₁ is the
+g-prep's counts (nothing relaxes the ground state: the counts ARE the
+confusion's first row), and row₂ is the e-prep's counts unwound through the
+survive factor F, the PAYLOAD-DRIVEN ROLLOUT's excited marginal at the
+window's end (the belief-side model, one rollout — see the section
+docstring for why this and not the state-prep precedent's analytic
+e^(−γT)). The per-entry σ's derive from the counts' binomial statistics
+(row₂ through the correction's error propagation); the recovery claim is
+5σ per entry. Rows are renormalized to unit sum (the counts carry shot
+noise)."""
+function fit_confusion(rig::RehearsalRig, design::ConfusionDesign,
+                       result::ConfusionResult)
+    pc = _piccolo_ext()
+    belief = believed(rig.twin)
+    N = result.shots
+    N ≥ 1 || error("fit_confusion: the accumulated shot count must be ≥ 1")
+    length(result.q_ground) == length(result.q_excited) == 2 || error(
+        "fit_confusion: the twin's v1 readout is 2-outcome (got g: " *
+        "$(length(result.q_ground)), e: $(length(result.q_excited)))")
+
+    # the survive factor: the e-prep payload's belief-side rollout — the
+    # excited marginal at the window's end, the exact transfer the row-2
+    # recovery must unwind (the fit never sees the twin's truth)
+    bparams = Dict{Symbol,Float64}(
+        Symbol(k) => Float64(v) for (k, v) in belief if v isa Real)
+    F = _wire_marginal_wire(rig, bparams, result.jobs.e_wire)[2]
+    0 < F ≤ 1 || error(
+        "fit_confusion: the e-prep's payload-driven transfer is $F — the " *
+        "row-2 recovery needs a genuine excitation (0 < F ≤ 1); is the " *
+        "excitation landing, or is the belief's frame far off?")
+
+    # row 1: the g-prep's counts, binomial σ per entry
+    row1 = copy(result.q_ground)
+    σ1 = [sqrt(max(q * (1 - q), 1e-12) / N) for q in row1]
+
+    # row 2: the e-prep's counts unwound through F, with the correction's
+    # error propagation (row₁'s variance rides the (1−F) term)
+    row2 = [(result.q_excited[j] - (1 - F) * row1[j]) / F for j in 1:2]
+    σ2 = [sqrt(max(result.q_excited[j] * (1 - result.q_excited[j]), 1e-12) / N +
+               (1 - F)^2 * σ1[j]^2) / F for j in 1:2]
+    all(>=(0), row2) || error(
+        "fit_confusion: the recovered second row carries negative entries " *
+        "($(row2)) — the counts are inconsistent with the payload-driven " *
+        "transfer F = $F (is the excitation landing, or is the shot count " *
+        "too small?)")
+    row1 ./= sum(row1)
+    row2 ./= sum(row2)
+
+    Ĉ = Matrix{Float64}([row1'; row2'])
+    σ̂ = Matrix{Float64}([σ1'; σ2'])
+
+    # the belief-agreement gate: against a prior readout_confusion belief
+    # (the wrapped form the calibrate! write-back lands) when one exists —
+    # the first calibration has the record's placeholder OUTSIDE belief,
+    # nothing to disagree with
+    prior_C = pc._cert_belief_confusion(rig.twin)
+    has_prior = haskey(belief, "readout_confusion")
+    agrees = !has_prior ||
+             all(abs(Ĉ[i, j] - prior_C[i, j]) ≤ pc.BOSONIC_CERT_TOLERANCE_SIGMA * σ̂[i, j]
+                 for i in 1:2, j in 1:2)
+
+    return ConfusionFit(Ĉ, σ̂, F, agrees, result.provenance["seed"],
+        rig.twin.record.id,
+        Dict{String,Any}(
+            "record_id" => rig.twin.record.id,
+            "record_path" => rig.record_path,
+            "design" => "g/e preparations x $(N) shots; survive factor F = " *
+                        "$(round(F; digits = 4)) (the payload-driven rollout)",
+            "tolerance_rule" => string(
+                "recovery within $(pc.BOSONIC_CERT_TOLERANCE_SIGMA)·σ per entry; " *
+                "σ from the counts' binomial statistics (row₂ through the " *
+                "correction's error propagation over the payload-driven F)"),
+            "evidence_class" => "twin-rehearsal",
+            "tool" => "Strumento v$(pkgversion(Strumento)), julia $(VERSION)",
+        ))
+end
+
+"""The `write_back` seam (#38 wraps here): the measured confusion lands in
+the twin's BELIEF via `calibrate!` in the vault's WRAPPED noise form
+{value, estimate: false, note} — the exact form the certification
+machinery's belief-side confusion reader consumes (the transfer procedure's
+"measured confusion" source, now produced by a procedure). Never truth, and
+never the record: the twin's v1 response keeps rolling on the record's
+noise.readout_confusion (a static-from-record device property)."""
+function write_back!(rig::RehearsalRig, fitres::ConfusionFit)
+    calibrate!(rig.twin, Dict{String,Any}(
+        "readout_confusion" => Dict{String,Any}(
+            "value" => [[fitres.confusion[i, j] for j in 1:2] for i in 1:2],
+            "estimate" => false,
+            "note" => "measured readout calibration (twin-rehearsed; the " *
+                      "confusion procedure, issue #37; provenance: " *
+                      "$(get(fitres.provenance, "record_id", "?")))",
+        )))
+    return rig
+end
+
+"""
+    run_confusion(rig, design; jobs = fixture_confusion_jobs) -> ConfusionFit
+
+The confusion chain, one call: propose → compile → run over the wire →
+recover → write back. `jobs` is the compile seam's source: the committed
+fixture payloads (the default — the Julia-only lane) or a live bridge
+source (the PythonCall extension's `compile_confusion_points` over the
+design's `confusion_geometry`).
+
+Everything is a pure function of (rig, design, jobs, the twin's seed): a
+procedure run replays bit-exactly from its seed across fresh processes (the
+replay check: `test/configurations/calibration_replay_check.jl`).
+"""
+function run_confusion(rig::RehearsalRig, design::ConfusionDesign;
+                       jobs = fixture_confusion_jobs)
+    schedule = propose_confusion(rig, design)
+    payloads = jobs isa Function ? jobs(rig, schedule) : jobs
+    result = run_confusion_over_wire(rig, schedule, design, payloads)
+    fitres = fit_confusion(rig, design, result)
+    write_back!(rig, fitres)
+    return fitres
+end
+
+@testitem "the confusion procedure recovers the readout confusion through the wire within the DERIVED binomial bounds (the measured-confusion belief entry)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (bring-up extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        using Strumento: DriftPlan, instantiate, believed, advance!, calibrate!,
+                         OrnsteinUhlenbeck
+        ext = Base.get_extension(Strumento, :StrumentoBringupExt)
+        pc = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        record = joinpath(fixtures, "twins", "bosonic.md")
+        device = joinpath(fixtures, "multimode_rehearsal", "device.yaml")
+        soccfg = joinpath(fixtures, "multimode_rehearsal", "soccfg_v2_rehearsal.json")
+        wiring = TwinWiringMap([
+            TwinGenWiring(2, 1, 2; line = "qubit.drive"),
+            TwinGenWiring(3, 3, 4; line = "manipulate.main"),
+        ]; n_drives = 4)
+
+        plan = DriftPlan(:chi_kHz => [OrnsteinUhlenbeck(theta = 0.07, sigma = 3.0,
+                                                        mu = -298.4)])
+        make_rig(seed) = ext.RehearsalRig(record, device, soccfg, wiring;
+                                        drift = plan, seed = seed,
+                                        overlay_id = "rehearsal-v2")
+        rig = make_rig(0xC0FFEE)
+        try
+            advance!(rig.twin, 3.0)
+            truth_chi = rig.twin.truth[:chi_kHz]
+            n_truth = length(rig.twin.truth)
+            design = ext.ConfusionDesign()
+
+            # the record's confusion placeholder is estimate-flagged and
+            # does NOT enter the twin's belief — nothing has ever measured it
+            @test rig.twin.record.noise["readout_confusion"]["estimate"] == true
+            @test !haskey(believed(rig.twin), "readout_confusion")
+
+            fitres = ext.run_confusion(rig, design)   # propose -> wire -> recover -> write back
+
+            # ── the recovery: the counts ARE the twin's confusion acting (the
+            # record's placeholder is the twin's actual readout model in v1,
+            # static from record), within the DERIVED binomial bounds — 5σ
+            # per entry, σ from the counts' own statistics (row₂ through the
+            # correction's error propagation over the payload-driven F)
+            C_rows = rig.twin.record.noise["readout_confusion"]["value"]
+            C = [C_rows[i][j] for i in 1:2, j in 1:2]
+            @test size(fitres.confusion) == (2, 2)
+            for i in 1:2, j in 1:2
+                @test abs(fitres.confusion[i, j] - C[i, j]) <
+                      pc.BOSONIC_CERT_TOLERANCE_SIGMA * fitres.sigma[i, j]
+            end
+            # a real measurement: the estimate sits off the truth (shot noise)
+            @test fitres.confusion != C
+            @test all(>=(0), fitres.confusion)
+            @test all(i -> isapprox(sum(fitres.confusion[i, :]), 1.0; atol = 1e-9), 1:2)
+            # the survive factor is a genuine transfer (the π lands but is
+            # neither perfect nor nothing — the flip and its during-pulse decay)
+            @test 0.9 < fitres.survive_F < 1.0
+            # a real information scale: the binomial σ of ~150k shots per entry
+            @test all(s -> 1e-5 < s < 0.05, fitres.sigma)
+
+            # the belief-agreement flag is its DEFINITION: with no prior
+            # readout_confusion belief (the record's placeholder never
+            # entered belief) there is nothing to disagree with
+            @test fitres.agrees_with_belief
+
+            # ── the write-back: the measured confusion lands in the WRAPPED
+            # noise form, the exact form the certification machinery's
+            # belief-side reader consumes — the transfer procedure's
+            # "measured confusion" source, now produced by a procedure
+            wrapped = believed(rig.twin)["readout_confusion"]
+            @test wrapped isa AbstractDict
+            @test wrapped["estimate"] == false
+            @test [wrapped["value"][i][j] for i in 1:2, j in 1:2] == fitres.confusion
+            @test pc._cert_belief_confusion(rig.twin) == fitres.confusion
+
+            # the record's placeholder is untouched (the twin's v1 truth
+            # keeps rolling on it); truth keys untouched by the calibration
+            @test rig.twin.record.noise["readout_confusion"]["value"] == C_rows
+            @test rig.twin.record.noise["readout_confusion"]["estimate"] == true
+            @test length(rig.twin.truth) == n_truth
+            @test rig.twin.truth[:chi_kHz] == truth_chi
+
+            # drift moves truth ONLY: aging the twin leaves the calibrated
+            # belief exactly where the write-back put it
+            advance!(rig.twin, 1.0)
+            @test pc._cert_belief_confusion(rig.twin) == fitres.confusion
+            @test rig.twin.truth[:chi_kHz] != truth_chi
+
+            # the rehearsal evidence marking: twin-rehearsal, never device results
+            @test fitres.provenance["evidence_class"] == "twin-rehearsal"
+            @test fitres.seed == 0xC0FFEE
+            @test fitres.record_id == rig.twin.record.id
+
+            # ── a RE-CALIBRATION against the prior belief: the second run
+            # agrees with the written-back entry (its own derived bounds)
+            fit2 = ext.run_confusion(rig, design)
+            @test fit2.agrees_with_belief          # a sound recalibration agrees
+
+            # ── the run seam's decoded-window refusal: a design whose
+            # declared window differs from the payloads the wire runs
+            err = try
+                ext.run_confusion(rig, ext.ConfusionDesign(T_pi_us = 8.0)); nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("does not match", sprint(showerror, err))
+        finally
+            ext.stop!(rig)
+        end
+
+        # ── seeded replay, in-process form: two FRESH rigs with the same
+        # seed reproduce the whole procedure bit-exactly; a different seed
+        # differs (the shot draws)
+        run_it(seed) = begin
+            r = make_rig(seed)
+            try
+                advance!(r.twin, 3.0)
+                ext.run_confusion(r, ext.ConfusionDesign())
+            finally
+                ext.stop!(r)
+            end
+        end
+        a = run_it(0x5EED)
+        b = run_it(0x5EED)
+        c = run_it(0xFEED)
+        @test a.confusion == b.confusion && a.sigma == b.sigma
+        @test a.survive_F == b.survive_F
+        @test a.confusion != c.confusion
     end
 end

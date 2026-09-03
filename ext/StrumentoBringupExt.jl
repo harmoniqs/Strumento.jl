@@ -68,6 +68,10 @@ export RamseyDesign, ramsey_axis_us, ramsey_geometry,
 export T1Design, t1_axis_us, t1_geometry,
     T1Schedule, T1Job, T1Result, T1Fit,
     propose_t1, run_t1_over_wire, fit_t1, run_t1_sweep, fixture_t1_jobs
+export ConfusionDesign, confusion_geometry,
+    ConfusionSchedule, ConfusionJobs, ConfusionResult, ConfusionFit,
+    propose_confusion, run_confusion_over_wire, fit_confusion, run_confusion,
+    fixture_confusion_jobs
 
 include("bringup.jl")
 

@@ -58,6 +58,9 @@ export RehearsalRig, wire_address, stop!
 export ResonatorSweepDesign, comb_geometry,
     BringupSchedule, BringupJob, BringupResult, ResonatorSweepFit,
     propose, run_over_wire, write_back!, run_resonator_sweep, fixture_comb_jobs
+export RabiSweepDesign, rabi_axis, rabi_geometry,
+    RabiSchedule, RabiJob, RabiResult, RabiSweepFit,
+    propose_rabi, run_rabi_over_wire, run_rabi_sweep, fixture_rabi_job
 
 include("bringup.jl")
 

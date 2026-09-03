@@ -1863,7 +1863,7 @@ end
                 ext.RehearsalRig(record, device, soccfg, wiring;
                                 drift = plan, seed = seed, overlay_id = "rehearsal-v2",
                                 exact = exact)
-            bridge = pext.BringupBridge(device; overlay_id = "rehearsal-v2")
+            bridge2 = pext.BringupBridge(device; overlay_id = "rehearsal-v2")
             design = ext.RabiSweepDesign()
 
             rig_cal = make_rig(0xBEEF)
@@ -1883,7 +1883,7 @@ end
                 # the calibrated side: the whole loop — live sweep compile
                 # -> wire -> fit -> belief
                 live_design_job(r, s) = begin
-                    wire = pext.compile_rabi_sweep(bridge; ext.rabi_geometry(design)...)
+                    wire = pext.compile_rabi_sweep(bridge2; ext.rabi_geometry(design)...)
                     ext.RabiJob(wire, ext._job_shots(r, wire))
                 end
                 fitres = ext.run_rabi_sweep(rig_cal, design; job = live_design_job)
@@ -1894,10 +1894,10 @@ end
                 # gain (the belief-scaled path — the fraction the
                 # calibration store carries) vs the uncalibrated baseline
                 # (the device calibration's own stale gain)
-                cal_wire = pext.compile_ge_pi(bridge;
+                cal_wire = pext.compile_ge_pi(bridge2;
                                               gain_frac = believed(rig_cal.twin)["pi_gain"],
                                               reps = 50, soft_avgs = 1)
-                base_wire = pext.compile_ge_pi(bridge; reps = 50, soft_avgs = 1)
+                base_wire = pext.compile_ge_pi(bridge2; reps = 50, soft_avgs = 1)
                 @test base_wire == JSON.parsefile(joinpath(fixtures, "_fixtures",
                                                           "gepi_baseline_rehearsal.json"))
 

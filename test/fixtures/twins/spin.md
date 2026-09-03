@@ -16,6 +16,7 @@ noise:
   T2_star_us: {value: 0.4, estimate: false, note: "synthetic canonical-style value"}
   T1_us: {value: 180.0, estimate: false, note: "same source"}
   gamma_cross_rel: {value: 0.08, estimate: false, note: "cross-correlated dephasing ratio"}
+  readout_confusion: {value: [[0.93, 0.07], [0.05, 0.95]], estimate: false, note: "synthetic PSB-flavor charge-sensor confusion (sensor-low / sensor-high)"}
 drift_priors:
   delta_MHz:
     process: ou            # charge noise around the operating point
@@ -35,5 +36,7 @@ tags: [device-twin, spin, fixture]
 # Synthetic spin-pair twin — test fixture
 
 A test fixture in the spin seed family's shape: two-qubit exchange/EDSR pair
-with quasi-static charge noise (slow-OU limit) and a 50 MHz Zeeman split. All
-values synthetic.
+with quasi-static charge noise (slow-OU limit) and a 50 MHz Zeeman split, and
+the PSB-flavor charge-sensor readout confusion the twin's response machinery
+consumes (the seed record's own readout confusion is the PSB-readout flavor).
+All values synthetic.

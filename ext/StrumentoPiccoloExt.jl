@@ -32,6 +32,7 @@ import Strumento: AbstractSoc, execute!, load_envelope!, play_program!, acquire,
     pulse_to_envelopes,                 # the base verb: typed method added below
     QickProgram,                        # the base data contract: filled here
     pulse_duration, sample_controls,    # the pulse-sampling seam (typed methods below)
+    set_gate!, get_gate, gate_snapshot, gate_names,   # the DC control class (issue #35)
     DigitalTwin,                        # the twin the soc face wraps (issue #20)
     advance!                            # the drift advance the soc wires per acquire
 using TestItems
@@ -342,6 +343,10 @@ A simulated QICK SoC backed by a `DigitalTwin` — `MockSoc`'s drifting,
 readout-confused generalization, pluggable wherever the mock plugs in
 (same verbs, same IQ blob packing, same downstream discrimination).
 
+`ψ_init`/`ψ_goal` default to two-level placeholders: a DC-landscape family
+(issue #35, e.g. the spin charge-landscape class) never rolls a pulse — the
+pulse path refuses it actionably — so its twins construct without them.
+
 The forward model per acquire:
 
 1. **Roll the CURRENT-truth system** — `families[twin.record.family]` builds a
@@ -382,7 +387,7 @@ stochasticity flows from `twin.rng` — construct twins with
 mutable struct TwinSoc <: AbstractSoc
     twin::DigitalTwin
     family::String              # the record's family (the dispatch key used)
-    system_builder::Function    # (truth::Dict{Symbol,Float64}) -> QuantumSystem
+    system_builder::Function    # (truth::Dict{Symbol,Float64}) -> QuantumSystem | landscape
     confusion::Matrix{Float64}   # the record's readout confusion (rows = true states)
     ψ_init::Vector{ComplexF64}
     ψ_goal::Vector{ComplexF64}
@@ -392,11 +397,14 @@ mutable struct TwinSoc <: AbstractSoc
     dt::Float64
     dac_rate::Float64
     adc_rate::Float64
+    gates::Dict{String,Float64}  # the DC CONTROL field (issue #35) — beside truth/belief, touching neither
     _env::Dict{Int,Tuple{Vector{Float64},Vector{Float64}}}
     _program::Union{Nothing,QickProgram}
 end
 
-function TwinSoc(twin::DigitalTwin, ψ_init::AbstractVector, ψ_goal::AbstractVector;
+function TwinSoc(twin::DigitalTwin,
+                 ψ_init::AbstractVector = ComplexF64[1, 0],
+                 ψ_goal::AbstractVector = ComplexF64[0, 1];
                  families::AbstractDict{<:AbstractString},
                  measurement_fn::Function = populations,
                  shots::Integer = 100,
@@ -413,6 +421,7 @@ function TwinSoc(twin::DigitalTwin, ψ_init::AbstractVector, ψ_goal::AbstractVe
                    ComplexF64.(ψ_init), ComplexF64.(ψ_goal), measurement_fn,
                    Int(shots), exact, Float64(dt),
                    Float64(dac_rate), Float64(adc_rate),
+                   Dict{String,Float64}(),
                    Dict{Int,Tuple{Vector{Float64},Vector{Float64}}}(), nothing)
 end
 
@@ -536,6 +545,12 @@ function acquire(soc::TwinSoc, _ro_chs)
     #     form-polymorphic measurement paths (see bosonic_ancilla_populations)
     #     dispatch on the state's length.
     system = soc.system_builder(soc.twin.truth)
+    system isa AbstractChargeLandscape && error(
+        "TwinSoc.execute!: the $(repr(soc.family)) family builds a charge " *
+        "landscape, not a QuantumSystem — the PULSE path is the waveform " *
+        "control class; this family is driven through the DC control class " *
+        "(set_gate! + the charge-sensor readout). Two control classes, one " *
+        "twin — the pulsed spin experiments ride the pulse path in a later slice")
     knot_times = get_knot_times(recon)
     if system isa OpenQuantumSystem
         ρ0 = soc.ψ_init * soc.ψ_init'
@@ -1022,8 +1037,416 @@ end
 pulse_duration(pulse::AbstractPulse) = duration(pulse)
 sample_controls(pulse::AbstractPulse, times) = sample(pulse, times)
 
+# ──── The DC control path on the twin face (issue #35) ────────────────────────
+# The twin's DC state: a CONTROL field, the third channel beside truth and
+# belief (see src/dc.jl for the three-way separation law). The family seam
+# carries a landscape builder for DC families — an `AbstractChargeLandscape`
+# names its gates and maps the CURRENT gate controls (plus current truth) to
+# the true sensor discrimination probabilities; the soc's response machinery
+# (confusion + binomial shots) turns those into the readout blob.
+
+"""
+    AbstractChargeLandscape
+
+The family seam's DC-side return: a landscape built from the twin's CURRENT
+truth that names its DC gates and maps the current gate CONTROLS to the true
+charge-sensor discrimination probabilities. Implement:
+
+- `gate_names(landscape)` — the family's declared DC gates (a control
+  declaration, never truth);
+- `sensor_probabilities(landscape, gates)` — the true probability vector over
+  the record's readout outcomes at the given gate voltages (a function of
+  controls AND the truth the landscape was built from).
+"""
+abstract type AbstractChargeLandscape end
+
+"""The landscape interface: the family's declared DC gate names."""
+function gate_names end
+
+"""The landscape interface: the true sensor discrimination probabilities at
+the current gate controls (length = the record's confusion dimension)."""
+function sensor_probabilities end
+
+# The DC seam resolver: rebuilds the family object from CURRENT truth and
+# refuses non-landscape families actionably (two control classes, one twin).
+function _dc_landscape(soc::TwinSoc)
+    obj = soc.system_builder(soc.twin.truth)
+    obj isa AbstractChargeLandscape || error(
+        "TwinSoc DC path: the $(repr(soc.family)) family builds a " *
+        "$(typeof(obj)), not a charge landscape — the DC gate verbs need a " *
+        "landscape family (the spin charge-landscape class)")
+    return obj
+end
+
+set_gate!(soc::TwinSoc, gate::AbstractString, volts::Real) =
+    _set_validated_gate!(soc, gate, volts)
+
+get_gate(soc::TwinSoc, gate::AbstractString) =
+    _get_validated_gate(soc, gate)
+
+gate_snapshot(soc::TwinSoc) = begin
+    landscape = _dc_landscape(soc)
+    return Dict{String,Float64}(g => _get_validated_gate(soc, g, landscape)
+                               for g in gate_names(landscape))
+end
+
+function _set_validated_gate!(soc::TwinSoc, gate::AbstractString, volts::Real,
+                             landscape = _dc_landscape(soc))
+    gate in gate_names(landscape) || error(
+        "unknown DC gate $(repr(gate)) — the $(repr(soc.family)) landscape " *
+        "carries gates $(join(sort!(collect(repr.(gate_names(landscape)))), ", "))")
+    soc.gates[gate] = Float64(volts)   # the CONTROL field, beside truth/belief
+    return soc
+end
+
+function _get_validated_gate(soc::TwinSoc, gate::AbstractString,
+                            landscape = _dc_landscape(soc))
+    gate in gate_names(landscape) || error(
+        "unknown DC gate $(repr(gate)) — the $(repr(soc.family)) landscape " *
+        "carries gates $(join(sort!(collect(repr.(gate_names(landscape)))), ", "))")
+    return get(soc.gates, gate, 0.0)   # unset gate reads 0 V (the mock-source default)
+end
+
+# The DC READOUT — the measurement path the autotuning drives (issue #35):
+# rebuild the family landscape from CURRENT truth, map the current gate
+# CONTROLS to the true sensor discrimination probabilities, and respond
+# through the soc's ONE response home (the record's confusion remap +
+# binomial shot sampling from the twin's rng — the pulse path's own
+# machinery; the PSB-readout flavor the spin record's confusion carries).
+
+"""
+    read_charge_sensor(soc::TwinSoc) -> Vector{ComplexF64}
+
+The DC readout at the CURRENT gate controls: the landscape family's true
+sensor probabilities (a function of the gate controls AND the CURRENT truth)
+through the soc's one response home — the record's readout confusion remap
+then (`exact = false`, the default) binomial shot sampling, seeded from the
+twin's rng. Blobs pack exactly the way every soc blob packs (real data,
+`Vector{ComplexF64}`). Drift follows the pulse path's advance-after semantics:
+after the response, `dt > 0` ages the twin — read *k* measures truth at
+`(k-1)·dt`; `dt = 0` (the default) is static truth.
+"""
+function read_charge_sensor(soc::TwinSoc)
+    landscape = _dc_landscape(soc)
+    p = sensor_probabilities(landscape, soc.gates)
+    blob = _respond(soc, p)
+    soc.dt > 0 && advance!(soc.twin, soc.dt)
+    return blob
+end
+
+"""
+    charge_sensor_sweep(soc::TwinSoc, gate, volts) -> Vector{Vector{ComplexF64}}
+
+The DC sweep + sensor readout — the flow the autotuning procedures drive as
+feedback (M4b-2): sweep ONE gate across `volts` (the other gates hold their set
+values; the sweep drives the gate CONTROL through `set_gate!` — the
+autotuner's action) and read the charge sensor at each point. Blobs align
+with `volts`. The 2D charge-stability map is the nested sweep over both gate
+axes (a plain composition of this with a second sweep — the map acquisition
+the follow-on slice builds).
+"""
+function charge_sensor_sweep(soc::TwinSoc, gate::AbstractString,
+                             volts::AbstractVector{<:Real})
+    landscape = _dc_landscape(soc)
+    gate in gate_names(landscape) || error(
+        "unknown DC gate $(repr(gate)) — the $(repr(soc.family)) landscape " *
+        "carries gates $(join(sort!(collect(repr.(gate_names(landscape)))), ", "))")
+    return [begin
+        _set_validated_gate!(soc, gate, v, landscape)
+        read_charge_sensor(soc)
+    end for v in volts]
+end
+
+export read_charge_sensor, charge_sensor_sweep
+
+@testitem "TwinSoc DC path — gates are a CONTROL field (drift and calibration never touch them)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using Strumento: DriftPlan, Ramp, instantiate, advance!, calibrate!, believed
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        TwinSoc = ext.TwinSoc
+
+        # the toy landscape (test-side): the family seam's DC-side return
+        struct _ToyLandscape <: ext.AbstractChargeLandscape end
+        ext.gate_names(::_ToyLandscape) = ("a", "b")
+        ext.sensor_probabilities(::_ToyLandscape, gates) =
+            [1 - get(gates, "a", 0.0), get(gates, "a", 0.0)]
+        toy_landscape(truth) = _ToyLandscape()
+
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+        twin = instantiate(fixture; drift = DriftPlan(:omega => [Ramp(rate = 0.1)]), seed = 1)
+
+        # a DC-family twin constructs without pulse states (the pulse path
+        # refuses it; see the two-control-classes item)
+        soc = TwinSoc(twin; families = Dict("toy" => toy_landscape), exact = true)
+        @test soc.gates == Dict{String,Float64}()    # the control field starts empty
+
+        # set/get: a CONTROL write — truth and belief untouched
+        @test set_gate!(soc, "a", 0.25) === soc
+        @test get_gate(soc, "a") == 0.25
+        @test get_gate(soc, "b") == 0.0              # unset gate reads the 0 V default
+        @test gate_snapshot(soc) == Dict("a" => 0.25, "b" => 0.0)
+        @test twin.truth[:omega] == 1.0              # controls never move truth
+        @test believed(twin)["omega"] == 1.0        # ...nor belief
+
+        # an unknown gate is named actionably, with the landscape's gates listed
+        err = try
+            set_gate!(soc, "barrier", 0.1); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        msg = sprint(showerror, err)
+        @test occursin("barrier", msg) && occursin("\"a\"", msg) && occursin("\"b\"", msg)
+        err = try
+            get_gate(soc, "barrier"); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+
+        # ── the three-way separation, asserted LIVE ──
+        advance!(twin, 10.0)
+        @test twin.truth[:omega] ≈ 2.0               # drift moved truth...
+        @test soc.gates == Dict("a" => 0.25)         # ...never the controls
+        @test believed(twin)["omega"] == 1.0         # ...never belief
+        calibrate!(twin, Dict("omega" => 2.0))
+        @test believed(twin)["omega"] == 2.0         # calibration moved belief...
+        @test soc.gates == Dict("a" => 0.25)         # ...never the controls
+        @test twin.truth[:omega] ≈ 2.0               # ...never truth
+
+        # the control the autotuner set is still the control the twin holds
+        @test get_gate(soc, "a") == 0.25
+        @test gate_snapshot(soc) == Dict("a" => 0.25, "b" => 0.0)
+    end
+end
+
+@testitem "two control classes, one twin — each path refuses the other actionably" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using LinearAlgebra
+        using Strumento: DriftPlan, instantiate
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        TwinSoc = ext.TwinSoc
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "toy.md")
+        twin = instantiate(fixture; drift = DriftPlan(), seed = 1)
+
+        # ── a LANDSCAPE family: the PULSE path refuses it ──
+        struct _ToyLandscape2 <: ext.AbstractChargeLandscape end
+        ext.gate_names(::_ToyLandscape2) = ("a", "b")
+        ext.sensor_probabilities(::_ToyLandscape2, gates) = [0.5, 0.5]
+        soc = TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                      families = Dict("toy" => _ -> _ToyLandscape2()))
+        N = 11
+        pulse = LinearSplinePulse(0.1 .* randn(1, N), collect(range(0.0, 5.0, length = N)))
+        map = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1)]; n_drives = 1)
+        err = try
+            execute!(soc, pulse, map, [N]); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        msg = sprint(showerror, err)
+        @test occursin("landscape", msg)                 # what the family builds
+        @test occursin("DC", msg)                        # where to drive it instead
+
+        # ── a QUANTUM-SYSTEM family: the DC path refuses it ──
+        σx = ComplexF64[0 1; 1 0]; σz = ComplexF64[1 0; 0 -1]
+        toy_family(truth) = QuantumSystem(truth[:omega] * σz, [σx, σx],
+                                          [truth[:drive_bound], truth[:drive_bound]])
+        soc2 = TwinSoc(twin, ComplexF64[1, 0], ComplexF64[0, 1];
+                       families = Dict("toy" => toy_family))
+        err = try
+            set_gate!(soc2, "a", 0.1); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("not a charge landscape", sprint(showerror, err))
+    end
+end
+
+@testitem "the charge-sensor readout — the DC readout through the twin's response machinery (spin, seeded)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using Strumento: DriftPlan, Ramp, instantiate, advance!, believed
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "spin.md")
+        twin = instantiate(fixture; drift = DriftPlan(), seed = 0xC0FFEE)
+        builder = ext.spin_landscape_builder(twin.record)
+
+        # a DC-only twin: no pulse states, the landscape family at the seam
+        soc = ext.TwinSoc(twin; families = Dict("spin" => builder), exact = true)
+        set_gate!(soc, "L", 1.0)                     # the (2,0)/PSB side, 1 V = 1 GHz detuning
+
+        blob = ext.read_charge_sensor(soc)
+        @test blob isa Vector{ComplexF64}            # packed like every soc blob
+        @test all(iszero.(imag.(blob)))
+        @test sum(real.(blob)) ≈ 1.0 atol = 1e-9
+
+        # the response IS the direct forward model computed from public pieces:
+        # the landscape at CURRENT truth + the gate controls -> the true sensor
+        # probabilities -> the record's PSB confusion remap. `==`, no tolerance.
+        landscape = builder(twin.truth)
+        p_direct = ext.sensor_probabilities(landscape, soc.gates)
+        rows = twin.record.noise["readout_confusion"]["value"]
+        C = [Float64(rows[i][j]) for i in eachindex(rows), j in eachindex(rows)]
+        expected = [sum(C[i, j] * p_direct[i] for i in eachindex(p_direct))
+                    for j in eachindex(p_direct)]
+        @test real.(blob) == expected
+        # the confusion is APPLIED (the blob is not the raw sensor step)
+        @test real.(blob) != p_direct
+        @test real.(blob)[2] > 0.9                    # the (2,0) side reads sensor-high
+
+        # the (0,2) side reads sensor-low through the SAME chain
+        set_gate!(soc, "L", -1.0)
+        @test real.(ext.read_charge_sensor(soc))[2] < 0.1
+
+        # ── drift, advance-after semantics shared with the pulse path: read k
+        # measures truth at (k-1)·dt, THEN ages the twin ──
+        plan = DriftPlan(:J_max_MHz => [Ramp(rate = 10.0)])
+        twin_d = instantiate(fixture; drift = plan, seed = 7)
+        soc_d = ext.TwinSoc(twin_d; families = Dict("spin" => builder), exact = true, dt = 1.0)
+        set_gate!(soc_d, "L", 0.3)                     # a flank point: width-sensitive
+        b1 = ext.read_charge_sensor(soc_d)
+        @test twin_d.truth[:J_max_MHz] ≈ 105.0         # aged AFTER the pristine read
+        @test twin_d.t == 1.0
+        b2 = ext.read_charge_sensor(soc_d)             # this read saw J_max = 105
+        @test twin_d.truth[:J_max_MHz] ≈ 115.0
+        @test twin_d.t == 2.0
+        # the drift is FELT in the response: the widened anticrossing moved the
+        # flank's sensor-high probability by more than a rounding-plateau floor
+        @test abs(real.(b2)[2] - real.(b1)[2]) > 1e-4
+
+        # the diagonal read: the true 50/50 charge admixture through the
+        # record's confusion (q = Cᵀ·[0.5, 0.5] = [0.49, 0.51] for the fixture)
+        set_gate!(soc_d, "L", 0.0)
+        @test real.(ext.read_charge_sensor(soc_d)) ≈ [0.49, 0.51] atol = 1e-6
+
+        # ── the sampled mode: binomial shots from the twin's rng (the one
+        # stochastic source) ──
+        twin_s = instantiate(fixture; drift = DriftPlan(), seed = 0x5EED)
+        soc_s = ext.TwinSoc(twin_s; families = Dict("spin" => builder), shots = 64)
+        set_gate!(soc_s, "L", 1.0)
+        s1 = real.(ext.read_charge_sensor(soc_s))
+        @test sum(s1) == 1.0
+        @test all(x -> 64 * x == round(Int, 64 * x), s1)   # counts / 64
+        @test s1[2] > 0.7                                    # centers on the exact q (~0.95)
+
+        # a mismatched landscape dimension is refused by the response machinery
+        struct _BadLandscape <: ext.AbstractChargeLandscape end
+        ext.gate_names(::_BadLandscape) = ("a",)
+        ext.sensor_probabilities(::_BadLandscape, gates) = [0.2, 0.3, 0.5]
+        soc_bad = ext.TwinSoc(instantiate(fixture; drift = DriftPlan(), seed = 1);
+                              families = Dict("spin" => (_ -> _BadLandscape())))
+        err = try
+            ext.read_charge_sensor(soc_bad); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("measurement vector length", sprint(showerror, err))
+    end
+end
+
+@testitem "the charge-sensor sweep — a DC sweep produces the transition-signature trace (spin, seeded replay)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing
+        @info "skipping: no Piccolo in this environment (Piccolo-extension surface)"
+        @test true
+    else
+        using Piccolo
+        using Strumento: DriftPlan, Ramp, instantiate, advance!
+        ext = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        fixture = joinpath(pkgdir(Strumento), "test", "fixtures", "twins", "spin.md")
+        builder = nothing   # resolved per twin below (the record is fixed)
+        twin = instantiate(fixture; drift = DriftPlan(), seed = 0x5EED)
+        soc = ext.TwinSoc(twin;
+                         families = Dict("spin" => ext.spin_landscape_builder(twin.record)),
+                         exact = true)
+        set_gate!(soc, "R", 0.0)
+        vs = collect(range(-0.5, 0.5, length = 81))
+        trace = ext.charge_sensor_sweep(soc, "L", vs)
+        @test length(trace) == length(vs)
+
+        highs = [real.(b)[2] for b in trace]
+        # the transition signature: a monotone step between the record's
+        # confused plateaus, crossing its midpoint ON the gate diagonal
+        @test all(diff(highs) .> 0)
+        @test highs[1] < 0.1 && highs[end] > 0.9
+        crossing = vs[argmin(abs.(highs .- (highs[1] + highs[end]) / 2))]
+        @test abs(crossing) < 0.02                       # the step midpoint at v_L = v_R
+
+        # the sweep drove the CONTROL through the verbs: the gate state ends
+        # at the last point (the autotuner's action, held)
+        @test gate_snapshot(soc) == Dict("L" => 0.5, "R" => 0.0)
+
+        # an unknown gate in a sweep is named actionably
+        err = try
+            ext.charge_sensor_sweep(soc, "barrier", vs[1:2]); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("barrier", sprint(showerror, err))
+
+        # ── drift through the sweep: advance! moves truth, the next sweep
+        # rebuilds from CURRENT truth — the flanks move (the width), the
+        # crossing stays on the diagonal ──
+        plan = DriftPlan(:J_max_MHz => [Ramp(rate = 47.5)])
+        twin_d = instantiate(fixture; drift = plan, seed = 7)
+        soc_d = ext.TwinSoc(twin_d;
+                            families = Dict("spin" => ext.spin_landscape_builder(twin_d.record)),
+                            exact = true)
+        t_before = ext.charge_sensor_sweep(soc_d, "L", vs)
+        advance!(twin_d, 1.0)
+        t_after = ext.charge_sensor_sweep(soc_d, "L", vs)
+        @test t_before != t_after                       # the drifted truth is felt
+        h_b = [real.(b)[2] for b in t_before]
+        h_a = [real.(b)[2] for b in t_after]
+        cross_b = vs[argmin(abs.(h_b .- (h_b[1] + h_b[end]) / 2))]
+        cross_a = vs[argmin(abs.(h_a .- (h_a[1] + h_a[end]) / 2))]
+        @test abs(cross_a - cross_b) ≤ 2 * (vs[2] - vs[1])   # position unchanged
+        # and the move IS the width (a mid-step slope change, flanks differ)
+        @test abs(h_a[20] - h_b[20]) > 1e-3
+
+        # ── sampled sweeps replay bit-exact from the seed (the one-rng
+        # discipline: shots from the twin's rng, in sweep order) ──
+        function sweep_replay(seed)
+            t = instantiate(fixture; drift = DriftPlan(), seed = seed)
+            s = ext.TwinSoc(t;
+                           families = Dict("spin" => ext.spin_landscape_builder(t.record)),
+                           shots = 32)
+            set_gate!(s, "R", 0.0)
+            return ext.charge_sensor_sweep(s, "L", vs)
+        end
+        r1 = sweep_replay(0x5EED)
+        r2 = sweep_replay(0x5EED)
+        @test r1 == r2                                   # same seed, bit-exact
+        r3 = sweep_replay(0xFEED)
+        @test r3 != r1                                   # different seed, different draws
+        # every sampled blob is shot counts / shots
+        @test all(b -> all(x -> 32 * x == round(Int, 32 * x), real.(b)), r1)
+    end
+end
+
 # ──── The bosonic family (issue #21) ──────────────────────────────────────────
 include("bosonic_family.jl")
+
+# ──── The spin family (issue #35, M4b-1) ──────────────────────────────────────
+include("spin_family.jl")
 
 # ──── Certification gates (issue #22) ────────────────────────────────────────
 include("certification.jl")

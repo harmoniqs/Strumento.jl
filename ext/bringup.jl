@@ -1787,6 +1787,185 @@ end
     end
 end
 
+@testitem "the calibrated pi_gain beats the uncalibrated baseline through the wire (the paired downstream proof, python-optional)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing ||
+       Base.identify_package("PythonCall") === nothing
+        @info "skipping: the downstream proof needs Piccolo + JSON + PythonCall in this environment"
+        @test true
+    else
+        using PythonCall
+        ENV["PYTHONUTF8"] = "1"
+        st = try
+            pyimport("strumento")
+        catch e
+            @info "skipping: Python `strumento` not importable in this environment ($e)"
+            nothing
+        end
+        if st === nothing
+            @test true   # vacuous pass: the pure-Julia CI lane carries no Python strumento
+        else
+            using Piccolo
+            using JSON
+            using Strumento: DriftPlan, believed, advance!, OrnsteinUhlenbeck
+            ext = Base.get_extension(Strumento, :StrumentoBringupExt)
+            pext = Base.get_extension(Strumento, :StrumentoPythonCallExt)
+            js = Base.get_extension(Strumento, :StrumentoJobServerExt)
+
+            fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+            record = joinpath(fixtures, "twins", "bosonic.md")
+            device = joinpath(fixtures, "multimode_rehearsal", "device.yaml")
+            soccfg = joinpath(fixtures, "multimode_rehearsal", "soccfg_v2_rehearsal.json")
+            wiring = TwinWiringMap([
+                TwinGenWiring(2, 1, 2; line = "qubit.drive"),
+                TwinGenWiring(3, 3, 4; line = "manipulate.main"),
+            ]; n_drives = 4)
+
+            # ── first: the fit's honest refusal on a sweep that never peaks
+            # (a short live ladder below the pi-gain — the span does not
+            # cover it; needs the LIVE compile because the fixture carries
+            # the committed 0..120 geometry)
+            rig_short = ext.RehearsalRig(record, device, soccfg, wiring;
+                                         drift = DriftPlan(), seed = 7,
+                                         overlay_id = "rehearsal-v2")
+            try
+                bridge = pext.BringupBridge(device; overlay_id = "rehearsal-v2")
+                short_design = ext.RabiSweepDesign(gains_stop = 30, points = 11)
+                live_job(r, s) = begin
+                    wire = pext.compile_rabi_sweep(bridge;
+                                                  ext.rabi_geometry(short_design)...)
+                    ext.RabiJob(wire, ext._job_shots(r, wire))
+                end
+                err = try
+                    ext.run_rabi_sweep(rig_short, short_design; job = live_job); nothing
+                catch e
+                    e
+                end
+                @test err isa ErrorException
+                @test occursin("no oscillation maximum", sprint(showerror, err))
+            finally
+                ext.stop!(rig_short)
+            end
+
+            # ── THE PAIRED PROOF. Two FRESH rigs, the SAME seed, the SAME
+            # drift path, aged identically — everything but the gain
+            # calibration is shared. The calibrated rig runs the Rabi
+            # procedure (the LIVE bridge lane: Python compiles the sweep,
+            # the wire executes, Julia fits and writes the belief); the
+            # baseline rig gets no calibration at all. Then the same
+            # downstream compile — the ge_pi factory — runs through both
+            # wires: at the BELIEVED pi_gain on the calibrated side, at the
+            # device calibration's own stale gain on the baseline side.
+            plan = DriftPlan(:chi_kHz => [OrnsteinUhlenbeck(theta = 0.07, sigma = 3.0,
+                                                            mu = -298.4)])
+            make_rig(seed; exact = false) =
+                ext.RehearsalRig(record, device, soccfg, wiring;
+                                drift = plan, seed = seed, overlay_id = "rehearsal-v2",
+                                exact = exact)
+            bridge = pext.BringupBridge(device; overlay_id = "rehearsal-v2")
+            design = ext.RabiSweepDesign()
+
+            rig_cal = make_rig(0xBEEF)
+            rig_base = make_rig(0xBEEF)
+            rig_cal_x = make_rig(0xBEEF; exact = true)
+            rig_base_x = make_rig(0xBEEF; exact = true)
+            try
+                for r in (rig_cal, rig_base, rig_cal_x, rig_base_x)
+                    advance!(r.twin, 3.0)
+                end
+                # the PAIRING invariant: same seed, same drift path — the
+                # four twins carry one truth
+                @test rig_cal.twin.truth == rig_base.twin.truth ==
+                      rig_cal_x.twin.truth == rig_base_x.twin.truth
+                @test !haskey(believed(rig_base.twin), "pi_gain")   # no calibration yet
+
+                # the calibrated side: the whole loop — live sweep compile
+                # -> wire -> fit -> belief
+                live_design_job(r, s) = begin
+                    wire = pext.compile_rabi_sweep(bridge; ext.rabi_geometry(design)...)
+                    ext.RabiJob(wire, ext._job_shots(r, wire))
+                end
+                fitres = ext.run_rabi_sweep(rig_cal, design; job = live_design_job)
+                @test believed(rig_cal.twin)["pi_gain"] == fitres.pi_gain
+                @test fitres.provenance["evidence_class"] == "twin-rehearsal"
+
+                # the downstream compiles: the ge_pi factory at the believed
+                # gain (the belief-scaled path — the fraction the
+                # calibration store carries) vs the uncalibrated baseline
+                # (the device calibration's own stale gain)
+                cal_wire = pext.compile_ge_pi(bridge;
+                                              gain_frac = believed(rig_cal.twin)["pi_gain"],
+                                              reps = 50, soft_avgs = 1)
+                base_wire = pext.compile_ge_pi(bridge; reps = 50, soft_avgs = 1)
+                @test base_wire == JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                                          "gepi_baseline_rehearsal.json"))
+
+                # the belief lands on the true pi DAC CODE: the payload's
+                # own envelope fixes the flip-per-fraction scale I_env, so
+                # the twin's true pi-gain is pi/I_env — and the believed
+                # fraction quantizes onto its code (the calibration is
+                # REAL at wire resolution)
+                payload = js.read_payload(rig_cal.server.soccfg,
+                                          JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                                                 "rabi_rehearsal.json")))
+                drive = js.translate_drive(payload; expt = 2)
+                d = drive[collect(keys(drive))[1]]
+                g2 = payload.waves[payload.sweep_ladder[1][1]].gain_code +
+                     payload.sweep_ladder[1][3]
+                I_env = sum(sqrt.(d.uI .^ 2 .+ d.uQ .^ 2)) * 1e9 *
+                        (d.times[2] - d.times[1]) / (g2 / 32766)
+                theta_true = π / I_env
+                cal_code = only([w["gain"] for w in cal_wire["program"]["waves"]])
+                @test cal_code == Int(round(theta_true * 32766))
+
+                # the paired responses, sampled (the measurement world) and
+                # exact (the deterministic truth of the same pair)
+                pe(rig, wire) = begin
+                    acq = ext.run_job(rig.client, wire)
+                    return Float64(acq["iq"][1][1][2])
+                end
+                Pe_cal = pe(rig_cal, cal_wire)
+                Pe_base = pe(rig_base, base_wire)
+                Pe_cal_x = pe(rig_cal_x, cal_wire)
+                Pe_base_x = pe(rig_base_x, base_wire)
+
+                # the CALIBRATED one wins — sampled and exact, and the win
+                # is decisive against the paired shot noise
+                @test Pe_cal > Pe_base
+                @test Pe_cal_x > Pe_base_x
+                shots = rig_cal.soc.shots * 50
+                σ_pair = sqrt(max(Pe_cal * (1 - Pe_cal), 1e-9) / shots +
+                              max(Pe_base * (1 - Pe_base), 1e-9) / shots)
+                @test Pe_cal - Pe_base > 10 * σ_pair
+
+                # the calibrated flip reaches the readout's own ceiling
+                # (the record's confusion row for |e⟩ — semantic, computed
+                # from the record, never captured) within 5 points, and the
+                # baseline mis-flips by a decisive margin
+                C = rig_cal.twin.record.noise["readout_confusion"]["value"]
+                @test Pe_cal_x ≥ C[2][2] - 0.05
+                @test Pe_base_x ≤ Pe_cal_x - 0.25
+
+                # the sampled pair agrees with its exact truth (the
+                # measurement is the deterministic response plus noise)
+                @test abs(Pe_cal - Pe_cal_x) < 5 *
+                      sqrt(max(Pe_cal * (1 - Pe_cal), 1e-9) / shots)
+                @test abs(Pe_base - Pe_base_x) < 5 *
+                      sqrt(max(Pe_base * (1 - Pe_base), 1e-9) / shots)
+
+                # the calibration moved belief only: the calibrated twin's
+                # truth is the baseline twin's truth, still
+                @test rig_cal.twin.truth == rig_base.twin.truth
+            finally
+                for r in (rig_cal, rig_base, rig_cal_x, rig_base_x)
+                    ext.stop!(r)
+                end
+            end
+        end
+    end
+end
+
 @testitem "the resonator sweep through the LIVE bridge: Python compile -> wire -> fit -> write-back (python-optional)" begin
     using Strumento
     if Base.identify_package("Piccolo") === nothing ||

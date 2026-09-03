@@ -1225,6 +1225,9 @@ end
 # ──── The bosonic family (issue #21) ──────────────────────────────────────────
 include("bosonic_family.jl")
 
+# ──── The spin family (issue #35, M4b-1) ──────────────────────────────────────
+include("spin_family.jl")
+
 # ──── Certification gates (issue #22) ────────────────────────────────────────
 include("certification.jl")
 

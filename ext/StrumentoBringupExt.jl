@@ -72,6 +72,7 @@ export ConfusionDesign, confusion_geometry,
     ConfusionSchedule, ConfusionJobs, ConfusionResult, ConfusionFit,
     propose_confusion, run_confusion_over_wire, fit_confusion, run_confusion,
     fixture_confusion_jobs
+export CalibrationSetResult, run_calibration_set
 
 include("bringup.jl")
 

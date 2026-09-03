@@ -3826,3 +3826,208 @@ end
         @test a.confusion != c.confusion
     end
 end
+
+# ─── The composed bring-up pass (issue #37, the M4a-3 calibration set) ──────────
+#
+# The calibration set as ONE call: Ramsey → resonator sweep → Rabi → T1 →
+# confusion, each procedure writing its belief entries, over the rig, one
+# seeded run. THE ORDER is physics-mandated, not the issue's listing order:
+# the detuning lands FIRST — the frame offset contaminates every driven
+# procedure's model until the belief carries it (the comb's line positions
+# shift by Δ and its χ fit would absorb a ~w·Δ bias; the Rabi's π-gain feels
+# the detuned drive) — and the Ramsey is the one procedure insensitive to
+# everything else (the cavity sits in vacuum for its whole window, and its
+# arms are envelope-authored, not gain-calibrated). Then the comb and the
+# Rabi (their `bparams` fold the measured detuning automatically — the
+# merge idiom carries every believed real into the model), then the T1 (the
+# analytic decay is insensitive to the frame), then the confusion (its
+# row-2 recovery's transfer is the payload-driven rollout, exact once the
+# frame is calibrated; the record's placeholder confusion it unwinds is the
+# v1 truth either way).
+#
+# This is the bring-up layer's first end-to-end shape — the #38 supervision
+# layer wraps it later (the seam names it consumes: propose/compile/run/fit/
+# write_back per procedure), and the drift-aware schedule (M4a-4) decides
+# when to re-run WHICH procedure from the record's own drift priors.
+
+"""
+    run_calibration_set(rig; ramsey, comb, rabi, t1, confusion, jobs) -> CalibrationSetResult
+
+The full calibration set over the rig, one seeded pass (issue #37): Ramsey →
+resonator sweep → Rabi → T1 → confusion (the physics-mandated order — see
+the section docstring), each procedure at its default design (overridable via
+the like-named keyword) and its default fixture-lane job source (overridable
+via `jobs`, a NamedTuple of the five sources — the bridge lane's live
+compiles).
+
+All five belief entries land (the write-backs ride the calibrate! merge):
+`chi_kHz` (the comb's calibrated value), `detuning_kHz`, `pi_gain` +
+`pi_rabi_mhz` (the amplitude ruler pair), `T1_q_us`, and `readout_confusion`
+(the wrapped measured matrix). The result carries the five fits, the final
+belief snapshot, and the rehearsal provenance.
+
+Everything is a pure function of (rig, designs, jobs, the twin's seed): the
+whole pass replays bit-exactly from its seed across fresh processes (the
+replay check: `test/configurations/calibration_replay_check.jl`).
+"""
+struct CalibrationSetResult
+    ramsey::RamseyFit
+    comb::ResonatorSweepFit
+    rabi::RabiSweepFit
+    t1::T1Fit
+    confusion::ConfusionFit
+    belief::Dict{String,Any}        # the belief snapshot, all entries landed
+    provenance::Dict{String,Any}
+end
+
+function run_calibration_set(rig::RehearsalRig;
+        ramsey::RamseyDesign = RamseyDesign(),
+        comb::ResonatorSweepDesign = ResonatorSweepDesign(),
+        rabi::RabiSweepDesign = RabiSweepDesign(),
+        t1::T1Design = T1Design(),
+        confusion::ConfusionDesign = ConfusionDesign(),
+        jobs = (ramsey = fixture_ramsey_jobs, comb = fixture_comb_jobs,
+                rabi = fixture_rabi_job, t1 = fixture_t1_jobs,
+                confusion = fixture_confusion_jobs))
+    set_ramsey = run_ramsey_sweep(rig, ramsey; jobs = jobs.ramsey)
+    set_comb = run_resonator_sweep(rig, comb; jobs = jobs.comb)
+    set_rabi = run_rabi_sweep(rig, rabi; job = jobs.rabi)
+    set_t1 = run_t1_sweep(rig, t1; jobs = jobs.t1)
+    set_confusion = run_confusion(rig, confusion; jobs = jobs.confusion)
+    return CalibrationSetResult(
+        set_ramsey, set_comb, set_rabi, set_t1, set_confusion,
+        deepcopy(believed(rig.twin)),
+        Dict{String,Any}(
+            "record_id" => rig.twin.record.id,
+            "record_path" => rig.record_path,
+            "order" => "ramsey -> comb -> rabi -> t1 -> confusion " *
+                       "(the physics-mandated order: the frame lands first)",
+            "evidence_class" => "twin-rehearsal",
+            "seed" => rig.seed,
+            "tool" => "Strumento v$(pkgversion(Strumento)), julia $(VERSION)",
+        ))
+end
+
+@testitem "the composed bring-up pass: the full calibration set over the rig in one seeded run (all belief entries landing)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (bring-up extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        using Strumento: DriftPlan, instantiate, believed, advance!, calibrate!,
+                         OrnsteinUhlenbeck
+        ext = Base.get_extension(Strumento, :StrumentoBringupExt)
+        js = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        pc = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        record = joinpath(fixtures, "twins", "bosonic.md")
+        device = joinpath(fixtures, "multimode_rehearsal", "device.yaml")
+        soccfg = joinpath(fixtures, "multimode_rehearsal", "soccfg_v2_rehearsal.json")
+        wiring = TwinWiringMap([
+            TwinGenWiring(2, 1, 2; line = "qubit.drive"),
+            TwinGenWiring(3, 3, 4; line = "manipulate.main"),
+        ]; n_drives = 4)
+
+        # the composed posture: a DRIFTED twin (χ aged off the record) whose
+        # truth also carries the seeded detuning — the world the whole set
+        # must bring up: the frame, the dispersive shift, the amplitude
+        # ruler, the decay, and the readout, one seeded pass.
+        plan = DriftPlan(:chi_kHz => [OrnsteinUhlenbeck(theta = 0.07, sigma = 3.0,
+                                                        mu = -298.4)])
+        rig = ext.RehearsalRig(record, device, soccfg, wiring;
+                              drift = plan, seed = 0xC0FFEE,
+                              overlay_id = "rehearsal-v2")
+        try
+            advance!(rig.twin, 3.0)
+            rig.twin.truth[:detuning_kHz] = 20.0        # the hidden frame offset
+            truth_chi = rig.twin.truth[:chi_kHz]
+            truth_keys = Set(keys(rig.twin.truth))
+            truth_snapshot = copy(rig.twin.truth)
+            T1_record = rig.twin.record.noise["T1_q_us"]["value"]
+            C_rows = rig.twin.record.noise["readout_confusion"]["value"]
+            C = [C_rows[i][j] for i in 1:2, j in 1:2]
+
+            # the π-gain's analytic truth, DERIVED from the payload (never a
+            # captured literal — the Rabi testitem's idiom)
+            payload = js.read_payload(rig.server.soccfg,
+                                      JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                                              "rabi_rehearsal.json")))
+            drive = js.translate_drive(payload; expt = 2)
+            d = drive[collect(keys(drive))[1]]
+            g2 = payload.waves[payload.sweep_ladder[1][1]].gain_code +
+                 payload.sweep_ladder[1][3]
+            I_env = sum(sqrt.(d.uI .^ 2 .+ d.uQ .^ 2)) * 1e9 *
+                    (d.times[2] - d.times[1]) / (g2 / 32766)
+            theta_true = π / I_env
+
+            # THE COMPOSED PASS — one call, one seeded run
+            result = ext.run_calibration_set(rig)
+            b = result.belief
+
+            # ── every recovered parameter vs its truth, within each
+            # procedure's own DERIVED tolerance:
+            # the frame (the seeded truth)
+            @test abs(result.ramsey.detuning_kHz - 20.0) <
+                  result.ramsey.detuning_tolerance_kHz
+            # the dispersive shift (the AGED truth — recovered only because
+            # the Ramsey landed first: the detuned twin shifts every ancilla
+            # transition by Δ, and a comb fit at a stale frame belief would
+            # absorb a ~Δ-scale bias, orders beyond this tolerance)
+            @test abs(result.comb.chi_kHz - truth_chi) < result.comb.chi_tolerance_kHz
+            # the amplitude ruler (the payload-derived analytic truth)
+            @test abs(result.rabi.pi_gain - theta_true) < result.rabi.pi_gain_tolerance
+            # the decay (the record's value, static from record in v1)
+            @test abs(result.t1.T1_us - T1_record) < result.t1.T1_tolerance_us
+            # the readout confusion (the record's matrix, 5σ per entry)
+            for i in 1:2, j in 1:2
+                @test abs(result.confusion.confusion[i, j] - C[i, j]) <
+                      pc.BOSONIC_CERT_TOLERANCE_SIGMA * result.confusion.sigma[i, j]
+            end
+
+            # ── all belief entries landed (the calibrate! merge): the
+            # record's 7 parameters + the 5 calibration entries — the frame,
+            # the ruler pair, the decay, and the measured confusion
+            @test length(b) == 12
+            @test b["chi_kHz"] == result.comb.chi_kHz
+            @test b["detuning_kHz"] == result.ramsey.detuning_kHz
+            @test b["pi_gain"] == result.rabi.pi_gain
+            @test b["pi_rabi_mhz"] == result.rabi.pi_rabi_mhz
+            @test b["T1_q_us"] == result.t1.T1_us
+            @test [b["readout_confusion"]["value"][i][j] for i in 1:2, j in 1:2] ==
+                  result.confusion.confusion
+            @test b["readout_confusion"]["estimate"] == false
+
+            # ── the truth/belief invariant live THROUGHOUT: the pass moved
+            # belief only — every truth key's value is where the drift left
+            # it (the set never touches truth), and the record is untouched
+            @test Set(keys(rig.twin.truth)) == truth_keys
+            @test rig.twin.truth == truth_snapshot
+            @test rig.twin.truth[:detuning_kHz] == 20.0
+            @test rig.twin.record.noise["T1_q_us"]["value"] == T1_record
+            @test rig.twin.record.noise["T1_q_us"]["estimate"] == true
+            @test rig.twin.record.noise["readout_confusion"]["value"] == C_rows
+
+            # drift moves truth ONLY: aging the twin after the pass moves
+            # truth and leaves every landed belief entry exactly where the
+            # set wrote it
+            advance!(rig.twin, 1.0)
+            @test rig.twin.truth[:chi_kHz] != truth_chi
+            @test believed(rig.twin) == b
+
+            # the transfer-consumer: the measured confusion the set landed is
+            # the matrix the certification machinery reads
+            @test pc._cert_belief_confusion(rig.twin) == result.confusion.confusion
+
+            # the rehearsal evidence marking: twin-rehearsal, never device results
+            @test result.provenance["evidence_class"] == "twin-rehearsal"
+            @test result.ramsey.seed == result.comb.seed == result.rabi.seed ==
+                  result.t1.seed == result.confusion.seed == 0xC0FFEE
+        finally
+            ext.stop!(rig)
+        end
+    end
+end

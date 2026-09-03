@@ -80,8 +80,18 @@ compiles requested measurements to the `CompiledJob` wire form:
   experiment compiled at a fixed frequency: the seam's named target, the
   same compile + wire path exercised on the pack's own cavity-probe
   construction.
+- `compile_rabi_sweep(bridge; ...)` — the pi-gain procedure's gain ladder
+  (issue #33): the stock cqed `AmplitudeRabi` experiment — the ge_pi gauss
+  swept in lab-native gain int codes — compiled to ONE wire payload whose
+  swept axis rides the CloseLoop gain ladder (the v1-wire swept form the
+  twin job server decodes).
+- `compile_ge_pi(bridge; gain_frac = nothing, ...)` — the ge_pi factory
+  compiled at one point: the downstream consumption path. Without
+  `gain_frac`, the device calibration's own gain (the UNCALIBRATED
+  baseline); with it, the believed pi_gain (the belief-scaled factory —
+  `dev.qubit.ge_pi(gain = frac)` speaks v2 fractions directly).
 
-Both are deterministic given the device and the geometry (verified across
+All are deterministic given the device and the geometry (verified across
 fresh processes; the committed fixture payloads in
 `test/fixtures/_fixtures/` are this bridge's output, regenerable by the
 committed `generate_rehearsal_payloads.py`).
@@ -211,6 +221,91 @@ function compile_cavity_point(bridge::BringupBridge;
     axes = exp.axes()
     prog = StrumentoProgram(bridge.device; seq = seq, axes = axes,
                             reps = pyconvert(Py, Int(reps)))
+    job = prog.to_compiled_job(overlay_id = bridge.overlay_id,
+                               soft_avgs = pyconvert(Py, Int(soft_avgs)))
+    return _py_to_julia_dict(job.to_wire())
+end
+
+"""
+    compile_rabi_sweep(bridge; gains_start, gains_stop, points, reps,
+                       soft_avgs = 1) -> Dict
+
+Compile the pi-gain procedure's gain ladder (issue #33, the `CompiledJob`
+wire form): the stock cqed `AmplitudeRabi` experiment —
+`dev.qubit.ge_pi(gain = Sweep(gains_start → gains_stop))`, the ge_pi gauss
+swept in LAB-NATIVE gain int codes over `points` points on the declared
+"amp" loop axis — through the pack's own sequence construction and the
+core compile path. ONE payload comes back: the swept axis rides the CloseLoop
+gain ladder (qick's encoding-A wave-memory form, the v1-wire swept axis the
+twin job server decodes), the wave's gain stepping
+`(gains_stop − gains_start)/(points − 1)` codes per expt — an integer by
+construction of the declared span (the procedure refuses a non-integral
+ladder step: a fractional step would quantize differently per point and the
+decoded axis would not be the declared one).
+"""
+function compile_rabi_sweep(bridge::BringupBridge;
+                           gains_start::Integer,
+                           gains_stop::Integer,
+                           points::Integer,
+                           reps::Integer,
+                           soft_avgs::Integer = 1)
+    points ≥ 2 || error(
+        "compile_rabi_sweep: points must be ≥ 2 (got $points) — a ladder needs " *
+        "at least its two endpoints to step between")
+    (gains_stop - gains_start) % (points - 1) == 0 || error(
+        "compile_rabi_sweep: the gain span ($(gains_start) → $(gains_stop)) does not " *
+        "divide into $(points) points — the CloseLoop ladder steps integer gain " *
+        "codes, and a fractional step $(div(gains_stop - gains_start, points - 1)) " *
+        "would quantize differently per point (the decoded axis would not be " *
+        "the declared one)")
+    gains_start ≥ 0 || error(
+        "compile_rabi_sweep: gains_start must be ≥ 0 (got $gains_start) — a Rabi " *
+        "sweep starts at zero drive")
+    gains_stop > gains_start || error(
+        "compile_rabi_sweep: gains_stop ($gains_stop) must exceed gains_start " *
+        "($gains_start) — the sweep must rise")
+
+    Sweep = pyimport("strumento.core.sweeps").Sweep
+    AmplitudeRabi = pyimport(
+        "strumento.packs.cqed.experiments.amplitude_rabi").AmplitudeRabi
+    StrumentoProgram = pyimport("strumento.core.program").StrumentoProgram
+
+    exp = AmplitudeRabi(bridge.device,
+                        gains = Sweep(start = pyconvert(Py, Int(gains_start)),
+                                      stop = pyconvert(Py, Int(gains_stop)),
+                                      on = "amp"),
+                        points = pyconvert(Py, Int(points)))
+    seq, _ = exp.sequence()
+    axes = exp.axes()
+    prog = StrumentoProgram(bridge.device; seq = seq, axes = axes,
+                            reps = pyconvert(Py, Int(reps)))
+    job = prog.to_compiled_job(overlay_id = bridge.overlay_id,
+                               soft_avgs = pyconvert(Py, Int(soft_avgs)))
+    return _py_to_julia_dict(job.to_wire())
+end
+
+"""
+    compile_ge_pi(bridge; gain_frac = nothing, reps, soft_avgs = 1) -> Dict
+
+Compile ONE ge_pi pulse point (the `CompiledJob` wire form): the downstream
+consumption path of the pi-gain calibration (issue #33). `gain_frac` is the
+gain FRACTION the believed `pi_gain` carries — the factory's explicit
+override speaks v2 fractions directly (`dev.qubit.ge_pi(gain = frac)`),
+the production shape: Python compiles consume Julia-measured calibrations.
+Without `gain_frac`, the device calibration's own gain (int code → fraction,
+the UNCALIBRATED baseline the Rabi procedure exists to correct).
+"""
+function compile_ge_pi(bridge::BringupBridge;
+                       gain_frac = nothing,
+                       reps::Integer,
+                       soft_avgs::Integer = 1)
+    pulses = pyimport("strumento.core.pulses")
+    StrumentoProgram = pyimport("strumento.core.program").StrumentoProgram
+
+    dev = bridge.device
+    gain = gain_frac === nothing ? pybuiltins.None : pyconvert(Py, Float64(gain_frac))
+    seq = pulses.Seq().play(dev.qubit.ge_pi(gain = gain)).measure()
+    prog = StrumentoProgram(dev; seq = seq, reps = pyconvert(Py, Int(reps)))
     job = prog.to_compiled_job(overlay_id = bridge.overlay_id,
                                soft_avgs = pyconvert(Py, Int(soft_avgs)))
     return _py_to_julia_dict(job.to_wire())
@@ -555,6 +650,89 @@ end
         ext = Base.get_extension(Strumento, :StrumentoPythonCallExt)
         @test ext !== nothing
         @test isdefined(ext, :BringupBridge)
+    end
+end
+
+# ──── The Rabi-class compile surface (issue #33, M4a-2) ────────────────────────
+# The pi-gain procedure's compile lane: the stock cqed `AmplitudeRabi`
+# experiment (the Rabi-class named target) compiled to its CloseLoop
+# gain-ladder wire payload, and the ge_pi factory compiled at an explicit gain
+# fraction — the belief-scaled downstream path. Python-optional (the same
+# precedent as the comb/cavity items): the committed fixtures are this
+# surface's output, regenerable by the fixture-generation script.
+
+@testitem "BringupBridge compiles the Rabi gain ladder + the ge_pi factory (python-optional)" begin
+    using Strumento
+    if Base.identify_package("PythonCall") === nothing
+        @info "skipping: no PythonCall in this environment (PythonCall-extension surface)"
+        @test true
+    else
+        using PythonCall
+        pext = Base.get_extension(Strumento, :StrumentoPythonCallExt)
+        ENV["PYTHONUTF8"] = "1"
+        st = try
+            pyimport("strumento")
+        catch e
+            @info "skipping: Python `strumento` not importable in this environment ($e)"
+            nothing
+        end
+        if st === nothing
+            @test true
+        else
+            fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+            bridge = pext.BringupBridge(joinpath(fixtures, "multimode_rehearsal", "device.yaml");
+                                       overlay_id = "rehearsal-v2")
+
+            # ── the Rabi ladder: the stock experiment's gain sweep rides the
+            # CloseLoop ladder (the v1-wire swept axis): one expts axis, one
+            # played generator (the qubit drive), the ge_pi gauss at gain 0
+            # stepped +3 codes per expt (the declared 0..120 span over 41
+            # points, the ladder step (stop-start)/(points-1) exactly).
+            rabi = pext.compile_rabi_sweep(bridge; gains_start = 0, gains_stop = 120,
+                                           points = 41, reps = 50, soft_avgs = 1)
+            @test rabi["overlay_id"] == "rehearsal-v2"
+            @test rabi["acquire"]["expts"] == 41
+            @test rabi["acquire"]["reads_per_shot"] == [1]
+            @test sort([parse(Int, k) for k in keys(rabi["program"]["gen_chs"])]) == [2]
+            @test [w["gain"] for w in rabi["program"]["waves"]] == [0]
+
+            # in-process determinism (the compile half of the replay contract)
+            again = pext.compile_rabi_sweep(bridge; gains_start = 0, gains_stop = 120,
+                                            points = 41, reps = 50, soft_avgs = 1)
+            @test again == rabi
+
+            # the bridge reproduces the COMMITTED fixture bit-exactly (a
+            # strumento/qick upgrade that shifts a register code fails here
+            # loudly = regenerate the fixtures)
+            using JSON
+            @test rabi == JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                                  "rabi_rehearsal.json"))
+
+            # ── the ge_pi factory compile: the baseline (no gain override ->
+            # the device calibration's own int code 8192, the STALE amplitude
+            # calibration the Rabi procedure exists to correct) vs the
+            # belief-scaled path (an explicit gain FRACTION, the unit the
+            # believed pi_gain carries). The gain lands in the wave table as
+            # the fraction's own code (frac * maxv, integer by the fraction's
+            # quantization).
+            baseline = pext.compile_ge_pi(bridge; reps = 50, soft_avgs = 1)
+            @test baseline == JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                                     "gepi_baseline_rehearsal.json"))
+            @test [w["gain"] for w in baseline["program"]["waves"]] == [8192]
+            @test baseline["acquire"]["expts"] === nothing    # a fixed point, no sweep
+
+            calibrated = pext.compile_ge_pi(bridge; gain_frac = 43 / 32766,
+                                            reps = 50, soft_avgs = 1)
+            @test [w["gain"] for w in calibrated["program"]["waves"]] == [43]
+            @test calibrated["acquire"]["expts"] === nothing
+            # everything but the gain is the SAME compile (the paired shape:
+            # one knob differs)
+            cal_nogain = deepcopy(calibrated)
+            for w in cal_nogain["program"]["waves"]
+                w["gain"] = 8192
+            end
+            @test cal_nogain == baseline
+        end
     end
 end
 

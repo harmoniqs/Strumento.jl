@@ -69,10 +69,18 @@ calibration:
     T2: 50.0
     T2_echo: 80.0
     drag_alpha: 0.5
+    # The g-e pulse cals are authored for the rehearsal overlay's slow fabric
+    # (fs 12.5 MHz -> 12.5 samples/us): a stock 30-ns-sigma gauss is 1.5 samples
+    # on this fabric and qick refuses it (3-cycle minimum), so the pi/hpi/ef
+    # sigmas are us-scale (issue #33: the Rabi procedure's pi pulse must be
+    # compilable). gain 8192 is the rehearsal world's STALE amplitude
+    # calibration -- the uncalibrated baseline the Rabi procedure corrects
+    # (the twin's true pi gain is measured through the wire and lands in the
+    # belief store as pi_gain; the calibration value here never changes).
     pulses:
-      pi_ge:  {gain: 8192, sigma: 0.030, length: 0.0, type: gauss}
-      hpi_ge: {gain: 4096, sigma: 0.030, length: 0.0, type: gauss}
-      pi_ef:  {gain: 7600, sigma: 0.030, length: 0.0, type: gauss}
+      pi_ge:  {gain: 8192, sigma: 1.000, length: 0.0, type: gauss}
+      hpi_ge: {gain: 4096, sigma: 1.000, length: 0.0, type: gauss}
+      pi_ef:  {gain: 7600, sigma: 1.000, length: 0.0, type: gauss}
   readout:
     frequency: 1.0
     gain: 1000

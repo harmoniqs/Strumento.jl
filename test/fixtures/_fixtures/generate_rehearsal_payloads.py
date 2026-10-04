@@ -36,6 +36,32 @@ serialized through NpEncoder — JSON primitives all the way down):
   procedure exists to correct. The calibrated counterpart is compiled live
   at the fitted gain (the bridge's `compile_ge_pi` at the believed pi_gain) —
   its payload is a function of the fit and is never a fixture.
+- t1_rehearsal_NN.json — the T1 procedure's per-delay-point jobs (issue #37):
+  ge_pi at the Rabi-calibrated operating-point gain, a scalar `wait(delay_us)` (the
+  tProc literal TIME advance — the wire's TIME-param form), then Measure. One
+  payload per schedule point over T1_DELAYS_US; the ancilla decay the twin
+  rolls through the idle IS the observable (the exponential fit is
+  prep-agnostic: the excited population decays at 1/T1 from whatever
+  preparation the pulse leaves).
+- ramsey_rehearsal_NN.json — the Ramsey procedure's per-delay-point jobs
+  (issue #37): the comb geometry's cavity displacement (displace_alpha at
+  RAMSEY_DISPLACEMENT_ALPHA -> mean photon number nbar = alpha^2, the
+  ancilla-precession axis), the first half-pi (ge_hpi at RAMSEY_HPI_GAIN_FRAC),
+  a scalar `wait(delay_us)`, the second half-pi at +RAMSEY_SECOND_PHASE_DEG
+  (the distinct phase breaks the wave-table degeneracy — the same factory at
+  the same phase compiles to ONE wave-table entry played twice, which the
+  envelope-level reconstruction cannot distinguish), then Measure. The
+  fringe: the |e,n> component accumulates phase at chi*n per photon during
+  the idle (the only in-frame ancilla precession the v1 family carries), so
+  the delay fringe carries the transition's detuning from its believed
+  position at the calibration photon number.
+- confusion_g_rehearsal.json / confusion_e_rehearsal.json — the readout
+  confusion procedure's two preparations (issue #37): ge_pi at gain 0 (the
+  ground preparation — a played zero drive over the pi window) and ge_pi at
+  CAL_PI_GAIN_FRAC (the excited preparation, at the rehearsal's
+  Rabi-calibrated operating point). The counts over each prep's shots are
+  the confusion rows (the e row T1-corrected over the played window by the
+  procedure).
 
 Every payload is deterministic given the device and the geometry (verified
 across fresh processes); the JSON is integer-dominated (register codes, int16
@@ -70,6 +96,25 @@ FREQS_KHZ = np.concatenate([np.arange(230.0, 350.1, 15.0), np.arange(520.0, 640.
 # step is (stop - 0)/(points - 1) = 3 codes exactly (integer by construction).
 RABI_GAIN_STOP = 120
 RABI_POINTS = 41
+
+# The calibration-set geometries (issue #37; the values are shared with the
+# designs in ext/bringup.jl). The T1/Ramsey delay grids are authored in EXACT
+# DAC samples (12.5 samples/us -> 0.08 us granularity) so the literal TIME
+# advance quantizes onto the generator grid cleanly. The Ramsey half-pi gain
+# and the T1/confusion pi gains are the rehearsal world's committed operating
+# points: the twin-class pi-gain scale the Rabi procedure recovers (~43 int
+# codes). At the STALE calibration gain (8192 codes, ~190x the pi scale) the
+# gauss rotates with a ~25 ns period against the fabric's 80 ns sample grid —
+# an under-resolved overdrive whose rollout is knot-grid-dependent; the
+# calibration set's pi-based preparations ride the RESOLVED operating point
+# instead (the stale baseline keeps its role in the Rabi paired proof).
+T1_DELAYS_US = [0.0, 40.0, 80.0, 120.0, 160.0, 200.0, 240.0, 280.0]
+RAMSEY_DELAYS_US = [round(0.4 * k, 10) for k in range(0, 18)]   # 0.0 .. 6.8 us
+RAMSEY_DISPLACEMENT_ALPHA = 2.0 ** 0.5    # nbar = 2: the comb operating point
+RAMSEY_HPI_GAIN_FRAC = 0.0007             # ~half the twin-class pi-gain scale
+RAMSEY_SECOND_PHASE_DEG = 90.0            # the quadrature fringe; breaks the
+                                          # wave-table degeneracy
+CAL_PI_GAIN_FRAC = 43.0 / 32766.0   # the Rabi-calibrated operating point (the confusion e-prep rides it too)
 
 
 def comb_point(dev, f_khz):
@@ -135,6 +180,49 @@ def gepi_baseline_point(dev):
     return prog.to_compiled_job(overlay_id="rehearsal-v2", soft_avgs=1).to_wire()
 
 
+def t1_point(dev, delay_us):
+    """The T1 procedure's per-delay-point payload (issue #33's follow-on,
+    issue #37): ge_pi at the Rabi-calibrated operating-point gain, a scalar
+    wait, then Measure. The wait compiles to the tProc's literal TIME advance
+    (the wire's TIME-param form) between the pi's played extent and the
+    readout trigger."""
+    from strumento.core.program import StrumentoProgram
+    from strumento.core.pulses import Seq
+
+    seq = Seq().play(dev.qubit.ge_pi(gain=CAL_PI_GAIN_FRAC)).wait(delay_us).measure()
+    prog = StrumentoProgram(dev, seq=seq, reps=REPS)
+    return prog.to_compiled_job(overlay_id="rehearsal-v2", soft_avgs=1).to_wire()
+
+
+def ramsey_point(dev, delay_us):
+    """The Ramsey procedure's per-delay-point payload (issue #37): the cavity
+    displacement (the comb geometry's alpha), half-pi, scalar wait, the second
+    half-pi at +90 deg, Measure. The second pulse's distinct phase gives it
+    its own wave-table entry (a same-wave double play is invisible to the
+    envelope-level reconstruction)."""
+    from strumento.core.program import StrumentoProgram
+    from strumento.core.pulses import Seq
+
+    disp = dev.manipulate.displace_alpha(RAMSEY_DISPLACEMENT_ALPHA)
+    hpi1 = dev.qubit.ge_hpi(gain=RAMSEY_HPI_GAIN_FRAC)
+    hpi2 = dev.qubit.ge_hpi(gain=RAMSEY_HPI_GAIN_FRAC, phase=RAMSEY_SECOND_PHASE_DEG)
+    seq = Seq().play(disp).play(hpi1).wait(delay_us).play(hpi2).measure()
+    prog = StrumentoProgram(dev, seq=seq, reps=REPS)
+    return prog.to_compiled_job(overlay_id="rehearsal-v2", soft_avgs=1).to_wire()
+
+
+def confusion_point(dev, gain_frac):
+    """One confusion preparation (issue #37): ge_pi at `gain_frac` (0.0 = the
+    ground preparation; CONFUSION_PI_GAIN_FRAC = the excited preparation at
+    the Rabi-calibrated operating point), then Measure."""
+    from strumento.core.program import StrumentoProgram
+    from strumento.core.pulses import Seq
+
+    seq = Seq().play(dev.qubit.ge_pi(gain=gain_frac)).measure()
+    prog = StrumentoProgram(dev, seq=seq, reps=REPS)
+    return prog.to_compiled_job(overlay_id="rehearsal-v2", soft_avgs=1).to_wire()
+
+
 def main():
     from strumento import Device
 
@@ -150,7 +238,23 @@ def main():
         json.dump(rabi_point(dev), fh)
     with open(os.path.join(OUTDIR, "gepi_baseline_rehearsal.json"), "w") as fh:
         json.dump(gepi_baseline_point(dev), fh)
-    print(f"wrote {len(FREQS_KHZ)} comb points + 1 cavity + 1 rabi + 1 ge-pi baseline payload to {OUTDIR}")
+    for k, delay in enumerate(T1_DELAYS_US):
+        path = os.path.join(OUTDIR, f"t1_rehearsal_{k:02d}.json")
+        with open(path, "w") as fh:
+            json.dump(t1_point(dev, float(delay)), fh)
+    for k, delay in enumerate(RAMSEY_DELAYS_US):
+        path = os.path.join(OUTDIR, f"ramsey_rehearsal_{k:02d}.json")
+        with open(path, "w") as fh:
+            json.dump(ramsey_point(dev, float(delay)), fh)
+    with open(os.path.join(OUTDIR, "confusion_g_rehearsal.json"), "w") as fh:
+        json.dump(confusion_point(dev, 0.0), fh)
+    with open(os.path.join(OUTDIR, "confusion_e_rehearsal.json"), "w") as fh:
+        json.dump(confusion_point(dev, CAL_PI_GAIN_FRAC), fh)
+    print(
+        f"wrote {len(FREQS_KHZ)} comb + 1 cavity + 1 rabi + 1 ge-pi baseline + "
+        f"{len(T1_DELAYS_US)} t1 + {len(RAMSEY_DELAYS_US)} ramsey + 2 confusion "
+        f"payloads to {OUTDIR}"
+    )
 
 
 if __name__ == "__main__":

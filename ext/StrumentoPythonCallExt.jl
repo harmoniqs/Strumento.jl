@@ -92,7 +92,15 @@ compiles requested measurements to the `CompiledJob` wire form:
   compiled at one point: the downstream consumption path. Without
   `gain_frac`, the device calibration's own gain (the UNCALIBRATED
   baseline); with it, the believed pi_gain (the belief-scaled factory —
-  `dev.qubit.ge_pi(gain = frac)` speaks v2 fractions directly).
+  `dev.qubit.ge_pi(gain = frac)` speaks v2 fractions directly). Issue #37's
+  readout-confusion procedure reuses this path for its two preparations
+  (gain 0 = the ground prep; the operating-point gain = the excited prep).
+- `compile_t1_point(bridge; ...)` — the T1 procedure's per-delay-point job
+  (issue #37): ge_pi at the operating-point gain, a scalar wait (the literal
+  TIME advance), then Measure.
+- `compile_ramsey_point(bridge; ...)` — the Ramsey procedure's per-delay-point
+  job (issue #37): the cavity displacement, half-pi, scalar wait, the second
+  half-pi at a distinct phase, then Measure.
 
 All are deterministic given the device and the geometry (verified across
 fresh processes; the committed fixture payloads in
@@ -297,6 +305,11 @@ override speaks v2 fractions directly (`dev.qubit.ge_pi(gain = frac)`),
 the production shape: Python compiles consume Julia-measured calibrations.
 Without `gain_frac`, the device calibration's own gain (int code → fraction,
 the UNCALIBRATED baseline the Rabi procedure exists to correct).
+
+Issue #37's calibration set reuses this path for the readout-confusion
+procedure's two preparations: `gain_frac = 0` is the ground preparation (a
+played zero drive over the pi window), and the operating-point gain the
+excited preparation.
 """
 function compile_ge_pi(bridge::BringupBridge;
                        gain_frac = nothing,
@@ -308,6 +321,68 @@ function compile_ge_pi(bridge::BringupBridge;
     dev = bridge.device
     gain = gain_frac === nothing ? pybuiltins.None : pyconvert(Py, Float64(gain_frac))
     seq = pulses.Seq().play(dev.qubit.ge_pi(gain = gain)).measure()
+    prog = StrumentoProgram(dev; seq = seq, reps = pyconvert(Py, Int(reps)))
+    job = prog.to_compiled_job(overlay_id = bridge.overlay_id,
+                               soft_avgs = pyconvert(Py, Int(soft_avgs)))
+    return _py_to_julia_dict(job.to_wire())
+end
+
+"""
+    compile_t1_point(bridge; delay_us, pi_gain_frac, reps, soft_avgs = 1) -> Dict
+
+Compile the T1 procedure's per-delay-point payload (issue #37, the
+`CompiledJob` wire form): ge_pi at `pi_gain_frac` (the Rabi-calibrated
+operating point — a scalar `wait(delay_us)`; the literal TIME advance on the
+wire) then Measure. One payload per schedule point; the π–delay–measure
+sequence the decay curve rides.
+"""
+function compile_t1_point(bridge::BringupBridge;
+                          delay_us,
+                          pi_gain_frac,
+                          reps::Integer,
+                          soft_avgs::Integer = 1)
+    pulses = pyimport("strumento.core.pulses")
+    StrumentoProgram = pyimport("strumento.core.program").StrumentoProgram
+
+    dev = bridge.device
+    seq = pulses.Seq().play(dev.qubit.ge_pi(gain = pyconvert(Py, Float64(pi_gain_frac)))).wait(pyconvert(Py, Float64(delay_us))).measure()
+    prog = StrumentoProgram(dev; seq = seq, reps = pyconvert(Py, Int(reps)))
+    job = prog.to_compiled_job(overlay_id = bridge.overlay_id,
+                               soft_avgs = pyconvert(Py, Int(soft_avgs)))
+    return _py_to_julia_dict(job.to_wire())
+end
+
+"""
+    compile_ramsey_point(bridge; delay_us, displacement_alpha, hpi_gain_frac,
+                         second_phase_deg, reps, soft_avgs = 1) -> Dict
+
+Compile the Ramsey procedure's per-delay-point payload (issue #37, the
+`CompiledJob` wire form): the cavity displacement to `|β| =
+displacement_alpha` (the cqed pack's alpha-calibrated mode-library factory —
+the comb geometry's operating point), the first half-pi at `hpi_gain_frac`, a
+scalar `wait(delay_us)`, the second half-pi at `+second_phase_deg` (the
+distinct phase gives the second pulse its own wave-table entry — the same
+factory at the same phase compiles to one entry played twice, invisible to
+the envelope-level reconstruction), then Measure. The fringe rides the
+ancilla precession through the displaced cavity during the idle; the delay is
+the literal TIME advance on the wire.
+"""
+function compile_ramsey_point(bridge::BringupBridge;
+                              delay_us,
+                              displacement_alpha,
+                              hpi_gain_frac,
+                              second_phase_deg,
+                              reps::Integer,
+                              soft_avgs::Integer = 1)
+    pulses = pyimport("strumento.core.pulses")
+    StrumentoProgram = pyimport("strumento.core.program").StrumentoProgram
+
+    dev = bridge.device
+    disp = dev.manipulate.displace_alpha(pyconvert(Py, displacement_alpha))
+    hpi1 = dev.qubit.ge_hpi(gain = pyconvert(Py, Float64(hpi_gain_frac)))
+    hpi2 = dev.qubit.ge_hpi(gain = pyconvert(Py, Float64(hpi_gain_frac)),
+                            phase = pyconvert(Py, Float64(second_phase_deg)))
+    seq = pulses.Seq().play(disp).play(hpi1).wait(pyconvert(Py, Float64(delay_us))).play(hpi2).measure()
     prog = StrumentoProgram(dev; seq = seq, reps = pyconvert(Py, Int(reps)))
     job = prog.to_compiled_job(overlay_id = bridge.overlay_id,
                                soft_avgs = pyconvert(Py, Int(soft_avgs)))
@@ -888,6 +963,68 @@ end
                 w["gain"] = 8192
             end
             @test cal_nogain == baseline
+        end
+    end
+end
+
+@testitem "BringupBridge compiles the calibration set's per-delay points + the confusion preps (python-optional)" begin
+    using Strumento
+    if Base.identify_package("PythonCall") === nothing
+        @info "skipping: no PythonCall in this environment (PythonCall-extension surface)"
+        @test true
+    else
+        using PythonCall
+        pext = Base.get_extension(Strumento, :StrumentoPythonCallExt)
+        ENV["PYTHONUTF8"] = "1"
+        st = try
+            pyimport("strumento")
+        catch e
+            @info "skipping: Python `strumento` not importable in this environment ($e)"
+            nothing
+        end
+        if st === nothing
+            @test true   # vacuous pass: the pure-Julia CI lane carries no Python strumento
+        else
+            using JSON
+            fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+            bridge = pext.BringupBridge(joinpath(fixtures, "multimode_rehearsal", "device.yaml");
+                                        overlay_id = "rehearsal-v2")
+
+            # ── the T1 point: pi at the operating-point gain, scalar wait,
+            # measure — the literal TIME form; the committed fixture is this
+            # compile (the fixture script's constants, issue #37)
+            t1 = pext.compile_t1_point(bridge; delay_us = 120.0,
+                                       pi_gain_frac = 43 / 32766, reps = 50, soft_avgs = 1)
+            @test t1 == JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                                "t1_rehearsal_03.json"))
+
+            # ── the Ramsey point: displacement + half-pi + wait + second
+            # half-pi at +90 deg + measure; the distinct second phase breaks
+            # the wave-table degeneracy
+            ramsey = pext.compile_ramsey_point(bridge; delay_us = 1.6,
+                                               displacement_alpha = sqrt(2.0),
+                                               hpi_gain_frac = 0.0007,
+                                               second_phase_deg = 90.0,
+                                               reps = 50, soft_avgs = 1)
+            @test ramsey == JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                                    "ramsey_rehearsal_04.json"))
+
+            # ── the confusion preps ride the ge_pi factory compile: gain 0
+            # (the ground preparation) and the operating-point gain (the
+            # excited preparation)
+            g = pext.compile_ge_pi(bridge; gain_frac = 0.0, reps = 50, soft_avgs = 1)
+            @test g == JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                               "confusion_g_rehearsal.json"))
+            e = pext.compile_ge_pi(bridge; gain_frac = 43 / 32766, reps = 50, soft_avgs = 1)
+            @test e == JSON.parsefile(joinpath(fixtures, "_fixtures",
+                                               "confusion_e_rehearsal.json"))
+
+            # in-process determinism (the compile half of the replay contract)
+            @test pext.compile_ramsey_point(bridge; delay_us = 1.6,
+                                            displacement_alpha = sqrt(2.0),
+                                            hpi_gain_frac = 0.0007,
+                                            second_phase_deg = 90.0,
+                                            reps = 50, soft_avgs = 1) == ramsey
         end
     end
 end

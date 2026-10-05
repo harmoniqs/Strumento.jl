@@ -58,6 +58,9 @@ struct WirePayload
     reads_per_shot::Vector{Int}
     expts::Union{Nothing,Int}
     sweep_ladder::Vector{Tuple{Int,String,Int}} # (wave idx 1-based, field, per-expt step)
+    plays::Vector{Tuple{Int,Int}}               # (gen ch, wave idx) in PROG order, no dedup
+    idle_ticks::Vector{Int}                     # per play: literal TIME ticks after it
+    f_time_hz::Float64                           # the tProc timing clock (ticks per second)
 end
 
 # The soccfg facts a played generator contributes (fs in Hz, sample-memory
@@ -472,6 +475,17 @@ function read_payload(soccfg::AbstractDict, job_wire::AbstractDict)
         )
     # ── the CloseLoop sweep ladder (per-expt wave-field steps) ──
     ladder = _sweep_ladder(program, length(waves), derived_expts)
+
+    # ── the literal TIME advances (the calibration set's delay idles, issue
+    # #37) ── qick's `TIME inc_ref` with a literal tick count is the
+    # compiler's encoding of a scalar `wait` between played waves / before
+    # the readout trigger: static DATA in the payload, decoded not simulated
+    # (the same discipline as the ladder). The v1 realization: each played
+    # wave's extent is followed by the decoded idle — the played extents and
+    # idles chain the tProc's literal timeline. A REGISTER-driven advance
+    # (`TIME inc_ref R1:<reg>` — the stock swept-delay experiments' form) is
+    # outside the v1 literal lane and refused by name.
+    plays, idle_ticks, f_time_hz = _literal_timeline(program, soccfg, waves, gen_cfg)
     return WirePayload(
         string(job_wire["overlay_id"]),
         envelopes,
@@ -490,7 +504,130 @@ function read_payload(soccfg::AbstractDict, job_wire::AbstractDict)
         reads_per_shot,
         derived_expts,
         ladder,
+        plays,
+        idle_ticks,
+        f_time_hz,
     )
+end
+
+# The tProc timing clock, decoded from the snapshot (the literal advances are
+# its ticks; f_time in MHz in dump_cfg's tprocs entry).
+function _tproc_f_time_hz(soccfg::AbstractDict)
+    tprocs = get(soccfg, "tprocs", nothing)
+    (tprocs isa AbstractVector && !isempty(tprocs)) || error(
+        "read_payload: the overlay snapshot carries no tprocs entry — the " *
+        "literal TIME advances decode against the tProc's timing clock " *
+        "(f_time), part of dump_cfg() (D25: one overlay, one snapshot)",
+    )
+    haskey(tprocs[1], "f_time") || error(
+        "read_payload: the snapshot's tprocs[1] carries no `f_time` — the " *
+        "literal TIME advances decode against the tProc's timing clock",
+    )
+    return Float64(tprocs[1]["f_time"]) * 1e6
+end
+
+# The played wave's extent in tProc ticks: the compiler rounds the same
+# quantity (nsamp / fs × f_time) into the advance literal it emits after the
+# play, so the decode's expectation agrees with it within its own rounding.
+_wave_extent_ticks(facts::NamedTuple, wave::WireWave, f_time_hz::Float64) =
+    round(Int, wave.length_cycles * facts.samps_per_clk / facts.fs_hz * f_time_hz)
+
+"""Decode the payload's literal timeline: the plays in prog order and the
+literal idle ticks after each (issue #37). Walks prog_list once: each
+`WPORT_WR` on a driven generator records a play; each literal `TIME inc_ref`
+accumulates ticks into the gap since the last play; the gap closes (minus the
+just-played wave's extent — the compiler emits the extent itself) at the next
+play or at the readout trigger. Advances after the trigger are the readout
+window's, not the rollout's — ignored. Pre-play advances are lead-in, not
+idle — ignored (the rollout starts at the first played sample)."""
+function _literal_timeline(program::AbstractDict, soccfg::AbstractDict,
+                           waves::Vector{WireWave}, gen_cfg::AbstractDict)
+    f_time_hz = _tproc_f_time_hz(soccfg)
+    soccfg_gens = get(soccfg, "gens", [])
+    tproc_to_gen = Dict{Int,Int}(
+        _gen_facts(soccfg, ch).tproc_ch => ch for ch = 0:(length(soccfg_gens)-1)
+    )
+    plays = Tuple{Int,Int}[]
+    idles = Int[]
+    pending = 0
+    seen_trigger = false
+    n_waves = length(waves)
+    for inst in program["prog_list"]
+        cmd = get(inst, "CMD", "")
+        if cmd == "WPORT_WR"
+            seen_trigger && error(
+                "read_payload: a wave plays AFTER the readout trigger — the v1 " *
+                "response model samples the state at the trigger; plays must " *
+                "precede it",
+            )
+            dst, addr = get(inst, "DST", nothing), get(inst, "ADDR", nothing)
+            (dst isa AbstractString && addr isa AbstractString && startswith(addr, "&")) ||
+                error(
+                    "read_payload: a WPORT_WR entry lacks DST/ADDR — the port " *
+                    "assignment table is malformed",
+                )
+            haskey(tproc_to_gen, parse(Int, dst)) || continue   # a readout-config write
+            widx = parse(Int, addr[2:end]) + 1
+            1 ≤ widx ≤ n_waves || error(
+                "read_payload: WPORT_WR references wave $widx but the wave table " *
+                "holds $n_waves",
+            )
+            # close the previous play's gap: the literal advance minus the
+            # just-played extent is the idle (fuzz: the compiler's own
+            # rounding of the extent — a couple of ticks)
+            if !isempty(plays)
+                gen_ch, pwidx = plays[end]
+                idle = pending - _wave_extent_ticks(gen_cfg[gen_ch], waves[pwidx], f_time_hz)
+                abs(idle) ≤ 2 && (idle = 0)
+                idle ≥ 0 || error(
+                    "read_payload: the literal advance after wave $pwidx ($pending " *
+                    "ticks) is SHORTER than the wave's own played extent " *
+                    "($(_wave_extent_ticks(gen_cfg[gen_ch], waves[pwidx], f_time_hz)) " *
+                    "ticks for $(waves[pwidx].length_cycles * gen_cfg[gen_ch].samps_per_clk) " *
+                    "samples — a wave whose length outruns its played window is " *
+                    "named here) — the declared timeline is malformed",
+                )
+                idles[end] = idle
+            end
+            push!(plays, (tproc_to_gen[parse(Int, dst)], widx))
+            push!(idles, 0)
+            pending = 0
+        elseif cmd == "TIME" && get(inst, "C_OP", "") == "inc_ref" && !seen_trigger
+            haskey(inst, "R1") && error(
+                "read_payload: a `TIME inc_ref` rides register $(repr(inst["R1"])) — " *
+                "the REGISTER-driven time sweep (the stock swept-delay " *
+                "experiments' form) is outside the v1 literal-lane decode; the " *
+                "calibration procedures compile per-point payloads with scalar " *
+                "waits (the literal form — one payload per schedule point)",
+            )
+            haskey(inst, "LIT") && startswith(string(inst["LIT"]), "#") || error(
+                "read_payload: a `TIME inc_ref` carries no literal tick count — " *
+                "v1 decodes literal advances (#<ticks>)",
+            )
+            pending += parse(Int, string(inst["LIT"])[2:end])
+        elseif cmd == "TRIG" && get(inst, "SRC", "") == "set" && !seen_trigger
+            seen_trigger = true
+            if !isempty(plays)
+                gen_ch, pwidx = plays[end]
+                idle = pending - _wave_extent_ticks(gen_cfg[gen_ch], waves[pwidx], f_time_hz)
+                abs(idle) ≤ 2 && (idle = 0)
+                idle ≥ 0 || error(
+                    "read_payload: the literal advance before the readout trigger " *
+                    "($pending ticks) is SHORTER than the last played wave's own " *
+                    "extent ($(_wave_extent_ticks(gen_cfg[gen_ch], waves[pwidx], f_time_hz)) " *
+                    "ticks for $(waves[pwidx].length_cycles * gen_cfg[gen_ch].samps_per_clk) " *
+                    "samples — a wave whose length outruns its played window is named " *
+                    "here) — the declared timeline is malformed",
+                )
+                idles[end] = idle
+            end
+        end
+    end
+    isempty(plays) || seen_trigger || error(
+        "read_payload: the payload plays waves but declares no readout trigger " *
+        "(TRIG set) — the v1 response model samples the state at the trigger",
+    )
+    return plays, idles, f_time_hz
 end
 
 # ──── The envelope-level translation ─────────────────────────────────────────
@@ -550,16 +687,24 @@ Reconstruct the analog drive per generator channel, at the envelope level, for
 experiment point `expt` (1-based — the expts axis realized from the declared
 loop structure).
 
-Per wave (in the port plan's play order): the envelope segment is scaled from
-DAC codes to fractions of full scale (`code/maxv`), the gain is applied as the
-amplitude scale (`gain_code/maxv` — qick's "gain: −1.0 to 1.0 relative to max
-amplitude"), the carrier phase rotates the baseband quadratures, and the
-segments concatenate in play order (the flat-top shape; inter-wave TIMING is
-the tProc's — control flow, the complementary lane). `outsel` is honored per
-qick's cfg2reg semantics: "product" (envelope × gain, the DDS applied as the
-frame), "dds" (a constant drive at the gain, no envelope — the const-pulse
-path), "input" (the envelope's real part × gain), "zero" (silence for the
-wave's extent).
+Per wave (in the payload's global PLAY order): the envelope segment is scaled
+from DAC codes to fractions of full scale (`code/maxv`), the gain is applied
+as the amplitude scale (`gain_code/maxv` — qick's "gain: −1.0 to 1.0 relative
+to max amplitude"), the carrier phase rotates the baseband quadratures, and
+the segments concatenate in play order (the flat-top shape). The literal TIME
+advances between plays (issue #37's delay idles — see `_literal_timeline`)
+are realized as ZERO-DRIVE segments of the lane: an idle between two of a
+generator's plays pads that lane with zeros across it, and every lane spans
+the payload's whole literal timeline (played extents + idles) — the readout
+samples the state at the window's end, the trigger's position. Inter-wave
+OVERLAP (two generators declared concurrent) is realized as lane
+concatenation — each lane its own played sequence on the shared window, the
+documented v1 boundary.
+
+`outsel` is honored per qick's cfg2reg semantics: "product" (envelope × gain,
+the DDS applied as the frame), "dds" (a constant drive at the gain, no
+envelope — the const-pulse path), "input" (the envelope's real part × gain),
+"zero" (silence for the wave's extent).
 
 The CloseLoop ladder (when the payload carries one) offsets the stepped wave's
 gain code by `step × (expt − 1)` — the per-expt drive variation the compiled
@@ -575,60 +720,95 @@ surface, not v1.
 """
 function translate_drive(payload::WirePayload; expt::Integer = 1)
     expt ≥ 1 || error("translate_drive: expt must be ≥ 1 (got $expt)")
-    drives = Dict{Int,GenDrive}()
-    for (gen_ch, wave_idxs) in payload.port_plan
+    isempty(payload.plays) && return Dict{Int,GenDrive}()
+    fs0 = payload.gen_cfg[payload.plays[1][1]].fs_hz
+
+    # one played segment per play event: the wave-table assignment realized
+    # (envelope scaled, gain applied, phase rotated, outsel honored) — the
+    # identical arithmetic the pre-idle concatenation performed
+    function played_segment(gen_ch::Int, widx::Int)
         facts = payload.gen_cfg[gen_ch]
+        wave = payload.waves[widx]
+        # this expt's gain code: the wave-table value plus the CloseLoop
+        # ladder's per-expt offsets (identical for every expt when absent)
+        gain_code = wave.gain_code
+        for (lwidx, field, step) in payload.sweep_ladder
+            lwidx == widx && field == "gain" && (gain_code += step * (expt - 1))
+        end
+        # the Nyquist-zone band check (qick's freq2reg range contract)
+        f = wave.freq_MHz
+        fs = facts.f_dds_MHz
+        band = facts.nqz == 1 ? (0.0, fs / 2) : (fs / 2, fs)
+        (band[1] ≤ f ≤ band[2]) || error(
+            "translate_drive: wave $(repr(wave.name)) decodes to $f MHz but " *
+            "generator $gen_ch declares Nyquist zone $(facts.nqz) " *
+            "($(band[1])–$(band[2]) MHz) — the DDS code does not land in the " *
+            "declared zone",
+        )
+        g = gain_code / facts.maxv
+        nsamp = wave.length_cycles * facts.samps_per_clk
+        uI = Float64[]
+        uQ = Float64[]
+        if wave.outsel == "dds"
+            φ = deg2rad(wave.phase_deg)
+            append!(uI, fill(g * cos(φ), nsamp))
+            append!(uQ, fill(g * sin(φ), nsamp))
+        elseif wave.outsel == "zero"
+            append!(uI, zeros(nsamp))
+            append!(uQ, zeros(nsamp))
+        else
+            idata, qdata = _wave_segment(payload, gen_ch, wave)
+            φ = deg2rad(wave.phase_deg)
+            scale = 1.0 / facts.maxv
+            if wave.outsel == "input"
+                append!(uI, g .* scale .* idata)
+                append!(uQ, zeros(nsamp))
+            else   # "product": envelope x gain, the phase rotated in
+                c, s = cos(φ), sin(φ)
+                append!(uI, g .* scale .* (c .* idata .- s .* qdata))
+                append!(uQ, g .* scale .* (s .* idata .+ c .* qdata))
+            end
+        end
+        return uI, uQ, f
+    end
+
+    # the lanes: per gen, its played segments with the literal idles between
+    # its consecutive plays realized as zeros; every lane padded to the
+    # payload's whole literal timeline (all played extents + all idles, on
+    # the first played generator's DAC grid — the v1 uniform-fs assumption)
+    total_nsamp = sum(payload.waves[p[2]].length_cycles *
+                      payload.gen_cfg[p[1]].samps_per_clk for p in payload.plays) +
+                  sum(round(Int, t / payload.f_time_hz * fs0) for t in payload.idle_ticks)
+    drives = Dict{Int,GenDrive}()
+    for gen_ch in unique(first.(payload.plays))
+        own = [i for (i, (g, _)) in enumerate(payload.plays) if g == gen_ch]
         uI_all = Float64[]
         uQ_all = Float64[]
         carriers = Float64[]
-        for idx in wave_idxs
-            wave = payload.waves[idx]
-            # this expt's gain code: the wave-table value plus the CloseLoop
-            # ladder's per-expt offsets (identical for every expt when absent)
-            gain_code = wave.gain_code
-            for (widx, field, step) in payload.sweep_ladder
-                widx == idx && field == "gain" && (gain_code += step * (expt - 1))
-            end
-            # the Nyquist-zone band check (qick's freq2reg range contract)
-            f = wave.freq_MHz
-            fs = facts.f_dds_MHz
-            band = facts.nqz == 1 ? (0.0, fs / 2) : (fs / 2, fs)
-            (band[1] ≤ f ≤ band[2]) || error(
-                "translate_drive: wave $(repr(wave.name)) decodes to $f MHz but " *
-                "generator $gen_ch declares Nyquist zone $(facts.nqz) " *
-                "($(band[1])–$(band[2]) MHz) — the DDS code does not land in the " *
-                "declared zone",
-            )
+        for (k, i) in enumerate(own)
+            uI, uQ, f = played_segment(gen_ch, payload.plays[i][2])
+            append!(uI_all, uI)
+            append!(uQ_all, uQ)
             push!(carriers, f)
-            g = gain_code / facts.maxv
-            nsamp = wave.length_cycles * facts.samps_per_clk
-            if wave.outsel == "dds"
-                φ = deg2rad(wave.phase_deg)
-                append!(uI_all, fill(g * cos(φ), nsamp))
-                append!(uQ_all, fill(g * sin(φ), nsamp))
-            elseif wave.outsel == "zero"
-                append!(uI_all, zeros(nsamp))
-                append!(uQ_all, zeros(nsamp))
-            else
-                idata, qdata = _wave_segment(payload, gen_ch, wave)
-                φ = deg2rad(wave.phase_deg)
-                scale = 1.0 / facts.maxv
-                if wave.outsel == "input"
-                    append!(uI_all, g .* scale .* idata)
-                    append!(uQ_all, zeros(nsamp))
-                else   # "product": envelope x gain, the phase rotated in
-                    c, s = cos(φ), sin(φ)
-                    append!(uI_all, g .* scale .* (c .* idata .- s .* qdata))
-                    append!(uQ_all, g .* scale .* (s .* idata .+ c .* qdata))
-                end
+            # the idles from this play up to the gen's next own play advance
+            # the timeline between them: zeros in THIS lane
+            next_own = k < length(own) ? own[k + 1] : length(payload.plays) + 1
+            if i < next_own
+                idle_samps = sum(round(Int, payload.idle_ticks[j] / payload.f_time_hz * fs0)
+                                 for j in i:(next_own - 1))
+                append!(uI_all, zeros(idle_samps))
+                append!(uQ_all, zeros(idle_samps))
             end
         end
         isempty(uI_all) && error(
             "translate_drive: generator $gen_ch has a port plan but no wave " *
             "segments — the drive reconstruction produced nothing",
         )
-        dt = 1.0 / facts.fs_hz
-        times = collect(0.0:dt:((length(uI_all)-1)*dt))
+        # pad to the shared window (the trailing idle included)
+        append!(uI_all, zeros(total_nsamp - length(uI_all)))
+        append!(uQ_all, zeros(total_nsamp - length(uQ_all)))
+        dt = 1.0 / payload.gen_cfg[gen_ch].fs_hz
+        times = collect(0.0:dt:((total_nsamp - 1) * dt))
         drives[gen_ch] = GenDrive(times, uI_all, uQ_all, carriers)
     end
     return drives
@@ -1316,14 +1496,20 @@ end
         @test all(iszero, gdds.uQ)
 
         # ── multi-wave programs: the port plan concatenates the channel's
-        # waves in play order (the flat-top shape; inter-wave TIMING is the
-        # tProc's, the sequence is the wave table's).
+        # waves in play order (the flat-top shape; inter-wave TIMING is
+        # the tProc's, the sequence is the wave table's). The second play
+        # + its extent advance are inserted on the timeline after the
+        # first's played extent (a WPORT after the readout trigger is
+        # refused — plays precede the readout; a play overlapping another's
+        # extent is refused too).
         two = deepcopy(nosweep)
         push!(two["program"]["waves"], deepcopy(two["program"]["waves"][1]))
         wport = findfirst(i -> get(i, "CMD", "") == "WPORT_WR", two["program"]["prog_list"])
         inst = Dict(two["program"]["prog_list"][wport])
         inst["ADDR"] = "&1"
-        push!(two["program"]["prog_list"], inst)
+        extent = Dict(two["program"]["prog_list"][wport + 1])
+        insert!(two["program"]["prog_list"], wport + 2, inst)   # after the extent advance
+        insert!(two["program"]["prog_list"], wport + 3, extent) # ...and carries its own
         gtwo = ext.translate_drive(ext.read_payload(soccfg, two))[0]
         @test length(gtwo.times) == 2304
         @test gtwo.uI[1:1152] ≈ gpi.uI
@@ -1762,5 +1948,226 @@ end
         @test occursin("generator channel 3", msg)
         @test occursin("does not map", msg)
         @test occursin("2 -> (1, 2)", msg)         # the wired set, listed
+    end
+end
+
+# ─── The literal TIME advances — the calibration set's delay idles (issue #37) ──
+# The T1/Ramsey procedures' delays ride the tProc's literal TIME advances
+# (qick's `TIME inc_ref` with a literal tick count — the compiler's encoding of
+# a scalar `wait`): static DATA in the payload, decoded not simulated, the
+# same discipline as the CloseLoop ladder. The v1 response model realizes the
+# decoded idles as zero-drive segments of the rollout — the ancilla decay and
+# precession the twin rolls through the idle are LIVE (the Lindblad family).
+
+@testitem "read_payload decodes the literal TIME advances (plays, idles, the timing clock)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "multimode_rehearsal",
+                                         "soccfg_v2_rehearsal.json"))
+
+        # the timing clock is decoded from the snapshot itself (semantic, not
+        # captured: the tProc's f_time in ticks per second)
+        t1_120us = ext.read_payload(soccfg, JSON.parsefile(joinpath(
+            fixtures, "_fixtures", "t1_rehearsal_03.json")))   # delay 120.0 µs
+        @test t1_120us.f_time_hz ≈ 599.04e6 rtol = 1e-9
+
+        # the T1 point: ONE played wave (the stale-calibration ge_pi on gen 2),
+        # its played extent followed by the literal idle before the trigger
+        @test t1_120us.plays == [(2, 1)]
+        @test t1_120us.idle_ticks == [round(Int, 120.0 * 599.04)]   # 120 µs in ticks
+
+        # the Ramsey point: displacement (gen 3) then the two half-pis (gen 2),
+        # the literal idle BETWEEN them — π/2, delay, π/2 on the timeline
+        ramsey_16us = ext.read_payload(soccfg, JSON.parsefile(joinpath(
+            fixtures, "_fixtures", "ramsey_rehearsal_04.json")))  # delay 1.6 µs
+        @test ramsey_16us.plays == [(3, 1), (2, 2), (2, 3)]
+        @test ramsey_16us.idle_ticks == [0, round(Int, 1.6 * 599.04), 0]
+
+        # the committed payloads carry NO idles (their advances are the played
+        # extents exactly) — the decode must not disturb them
+        for name in ("comb_rehearsal_04.json", "rabi_rehearsal.json",
+                     "cavity_rehearsal.json", "gepi_baseline_rehearsal.json")
+            payload = ext.read_payload(soccfg, JSON.parsefile(joinpath(
+                fixtures, "_fixtures", name)))
+            @test payload.idle_ticks == zeros(Int, length(payload.plays))
+        end
+
+        # the confusion preparations: single played waves, no idles
+        for name in ("confusion_g_rehearsal.json", "confusion_e_rehearsal.json")
+            payload = ext.read_payload(soccfg, JSON.parsefile(joinpath(
+                fixtures, "_fixtures", name)))
+            @test length(payload.plays) == 1
+            @test payload.idle_ticks == [0]
+        end
+
+        # the testbench payloads too (a different soccfg — its own f_time)
+        tb = JSON.parsefile(joinpath(fixtures, "_fixtures", "soccfg_v2_testbench.json"))
+        for name in ("compiled_job_golden.json", "compiled_job_nosweep.json",
+                     "compiled_job_realspan.json")
+            payload = ext.read_payload(tb, JSON.parsefile(joinpath(
+                fixtures, "_fixtures", name)))
+            @test payload.idle_ticks == zeros(Int, length(payload.plays))
+        end
+    end
+end
+
+@testitem "translate_drive realizes the idles as zero-drive segments of the lanes" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "multimode_rehearsal",
+                                         "soccfg_v2_rehearsal.json"))
+
+        # ── the T1 point at 120 µs: gen 2's lane = the 50-sample pi followed
+        # by the idle zeros to the readout window (50 + 1500 samples at
+        # 12.5 samples/µs — the tick-quantized delay rounds onto the grid)
+        payload = ext.read_payload(soccfg, JSON.parsefile(joinpath(
+            fixtures, "_fixtures", "t1_rehearsal_03.json")))
+        drive = ext.translate_drive(payload)
+        @test sort(collect(keys(drive))) == [2]
+        g2 = drive[2]
+        idle_samples = round(Int, payload.idle_ticks[1] / payload.f_time_hz * 12.5e6)
+        @test length(g2.times) == 50 + idle_samples
+        @test all(iszero, g2.uI[51:end]) && all(iszero, g2.uQ[51:end])
+        @test !all(iszero, g2.uI[1:50])                   # the pi played first
+
+        # ── the Ramsey point at 1.6 µs: gen 2's lane = hpi1, idle zeros,
+        # hpi2 (the idle sits BETWEEN the pulses); gen 3's lane = the
+        # displacement then trailing zeros to the shared window
+        payload = ext.read_payload(soccfg, JSON.parsefile(joinpath(
+            fixtures, "_fixtures", "ramsey_rehearsal_04.json")))
+        drive = ext.translate_drive(payload)
+        @test sort(collect(keys(drive))) == [2, 3]
+        g2, g3 = drive[2], drive[3]
+        idle_samples = round(Int, payload.idle_ticks[2] / payload.f_time_hz * 12.5e6)
+        @test length(g2.times) == length(g3.times)       # one shared window
+        @test length(g2.times) == 150 + idle_samples
+        @test all(iszero, g2.uI[51:(50 + idle_samples)])  # the delay: zero drive
+        @test !all(iszero, g2.uI[(51 + idle_samples):end])# the second half-pi
+        @test !all(iszero, g3.uI[1:50])                   # the displacement
+        @test all(iszero, g3.uI[51:end])                  # then nothing
+
+        # ── the committed comb: zero idles — the lanes are the plain
+        # concatenation padded to the shared window (the pre-issue behavior)
+        comb = ext.read_payload(soccfg, JSON.parsefile(joinpath(
+            fixtures, "_fixtures", "comb_rehearsal_04.json")))
+        drive = ext.translate_drive(comb)
+        @test length(drive[2].times) == length(drive[3].times) == 225
+        @test all(iszero, drive[3].uI[51:end])           # disp then trailing zeros
+        @test !all(iszero, drive[2].uI[51:175])           # the probe's envelope
+    end
+end
+
+@testitem "the idle is live physics: the T1 payload's response decays through the wire" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        using Strumento: DriftPlan, instantiate
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        pc = Base.get_extension(Strumento, :StrumentoPiccoloExt)
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "multimode_rehearsal",
+                                         "soccfg_v2_rehearsal.json"))
+        bosonic = joinpath(fixtures, "twins", "bosonic.md")
+
+        twin = instantiate(bosonic; drift = DriftPlan(), seed = 0xC0FFEE)
+        builder = pc.bosonic_system_builder(twin.record)
+        meas = pc.bosonic_ancilla_populations(2, 12)
+        ψ = zeros(ComplexF64, 24); ψ[1] = 1.0
+        soc = pc.TwinSoc(twin, ψ, ψ; families = Dict("bosonic" => builder),
+                         measurement_fn = meas, shots = 512, exact = true,
+                         dac_rate = 0.0125)
+        # the declared routing (the rig's canonical map): the T1 payload plays
+        # one generator, and the bosonic family carries 4 drives — the map
+        # declares the n_drives, positional routing would guess 2
+        wiring = Strumento.TwinWiringMap(
+            [Strumento.TwinGenWiring(2, 1, 2; line = "qubit.drive"),
+             Strumento.TwinGenWiring(3, 3, 4; line = "manipulate.main")]; n_drives = 4)
+        server = ext.TwinJobServer(soc, soccfg; overlay_id = "rehearsal-v2",
+                                   wiring = wiring)
+
+        # three delay points of the committed T1 schedule (0, 120, 280 µs):
+        # the excited frequency decays MONOTONICALLY toward the |g⟩ confusion
+        # row, at the record's own T1 rate — the derived analytic pin (the
+        # ancilla population decays at γ₁ = 1/T1 through the idle; the
+        # measurement is the diagonal, so coherences never enter)
+        pe(τ_us) = Float64(ext.execute_job(server, JSON.parsefile(joinpath(
+            fixtures, "_fixtures", "t1_rehearsal_$(lpad(τ_us == 0 ? 0 : τ_us == 120 ? 3 : 7, 2, '0')).json")))["iq"][1][1][2])
+        q0, q120, q280 = pe(0), pe(120), pe(280)
+        @test q280 < q120 < q0
+        C = twin.record.noise["readout_confusion"]["value"]
+        r0 = C[1][2]                                       # the |g⟩ row's e slot
+        γ_ns = 1e-3 / twin.record.noise["T1_q_us"]["value"]
+        @test (q120 - r0) / (q0 - r0) ≈ exp(-γ_ns * 120_000) rtol = 1e-3
+        @test (q280 - r0) / (q0 - r0) ≈ exp(-γ_ns * 280_000) rtol = 1e-3
+
+        # the zero-delay point's π is the Rabi-calibrated operating-point
+        # compile: the flip reaches the readout's own confusion ceiling (the
+        # record's |e⟩ row) within 5 points — the same paired-proof margin
+        # the Rabi slice pins for the believed-gain compile
+        @test (q0 - r0) / (C[2][2] - C[1][2]) ≥ 0.95
+    end
+end
+
+@testitem "the register-driven time sweep is refused actionably (the v1 boundary)" begin
+    using Strumento
+    if Base.identify_package("Piccolo") === nothing ||
+       Base.identify_package("JSON") === nothing
+        @info "skipping: no Piccolo + JSON in this environment (job-server extension surface)"
+        @test true
+    else
+        using Piccolo
+        using JSON
+        ext = Base.get_extension(Strumento, :StrumentoJobServerExt)
+        fixtures = joinpath(pkgdir(Strumento), "test", "fixtures")
+        soccfg = JSON.parsefile(joinpath(fixtures, "multimode_rehearsal",
+                                         "soccfg_v2_rehearsal.json"))
+        t1 = JSON.parsefile(joinpath(fixtures, "_fixtures", "t1_rehearsal_03.json"))
+
+        # the stock swept-delay experiments compile the wait onto a tProc TIME
+        # REGISTER (init → consume by `TIME inc_ref R1:<reg>` → per-expt step):
+        # a register-driven advance is outside the v1 envelope+literal-lane —
+        # refused by name, with the per-point literal form pointed to
+        swept = deepcopy(t1)
+        prog = swept["program"]["prog_list"]
+        i_lit = findlast(prog) do inst
+            get(inst, "CMD", "") == "TIME" &&
+                haskey(inst, "LIT") && parse(Int, inst["LIT"][2:end]) == 71885
+        end
+        i_lit === nothing && error("test mutation anchor not found")
+        deleteat!(prog, i_lit)
+        insert!(prog, i_lit, Dict{String,Any}("CMD" => "REG_WR", "DST" => "r2",
+                                              "SRC" => "imm", "LIT" => "#71885"))
+        insert!(prog, i_lit + 1, Dict{String,Any}("CMD" => "TIME", "C_OP" => "inc_ref",
+                                                  "R1" => "r2"))
+        err = try
+            ext.read_payload(soccfg, swept); nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        msg = sprint(showerror, err)
+        @test occursin("register", msg)
+        @test occursin("per-point", msg)
     end
 end

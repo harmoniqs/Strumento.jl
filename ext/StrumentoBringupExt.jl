@@ -53,6 +53,7 @@ using TestItems
 using JSON
 using Piccolo
 using Sockets
+using LinearAlgebra: diagm, inv   # the T1 exponential fit's weighted normal equations
 
 export RehearsalRig, wire_address, stop!
 export ResonatorSweepDesign, comb_geometry,
@@ -61,6 +62,17 @@ export ResonatorSweepDesign, comb_geometry,
 export RabiSweepDesign, rabi_axis, rabi_geometry,
     RabiSchedule, RabiJob, RabiResult, RabiSweepFit,
     propose_rabi, run_rabi_over_wire, run_rabi_sweep, fixture_rabi_job
+export RamseyFringeDesign, ramsey_geometry,
+    RamseySchedule, RamseyJob, RamseyResult, RamseyFringeFit,
+    propose_ramsey, run_ramsey_over_wire, run_ramsey_sweep, fixture_ramsey_jobs
+export T1DecayDesign, t1_geometry,
+    T1Schedule, T1Job, T1Result, T1DecayFit,
+    propose_t1, run_t1_over_wire, run_t1_sweep, fixture_t1_jobs
+export ReadoutConfusionDesign, confusion_geometry,
+    ConfusionSchedule, ConfusionJob, ReadoutConfusionResult,
+    propose_confusion, run_confusion_over_wire, run_confusion_calibration,
+    fixture_confusion_jobs
+export BringupPassResult, run_bringup_pass
 
 include("bringup.jl")
 

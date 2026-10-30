@@ -1,85 +1,67 @@
 """
     Strumento
 
-The Julia face of the Python **strumento** QICK tProc-v2 experiment framework — the
-standalone substrate layer (the soc registry: real/mock/twin boards).
+**Deprecated and archived.** Strumento.jl v0.4 is a re-export shim over
+[Intonato](https://github.com/harmoniqs/Intonato.jl) ≥ 0.5, which now owns the soc
+substrate (top level), the digital-twin core (`Intonato.Twins`) and the Python
+delegation soc (`StrumentoSoc`, via the `IntonatoPythonCallExt` extension).
 
-**One source of truth (option a).** The device model, pulse IR, compiler, and program
-assembly live in Python `strumento`; this package is a *binding*, not a reimplementation.
-The real-board path (`StrumentoSoc`, the PythonCall extension) hands a solved pulse to
-Python `strumento` over PythonCall (`from_solution → compile → acquire → reduce`) —
-Julia never assembles an `AveragerProgramV2` itself. A pure-Julia `MockSoc` (the
-Piccolo extension) rolls the pulse through a `QuantumSystem` (Piccolo-native
-propagation) so the whole board-free mock path runs and is tested with no Python and
-no hardware.
+Every name exported here is the *same object* as its Intonato / `Intonato.Twins`
+binding — not a copy — so code written against Strumento 0.3's base surface keeps
+working while it migrates. Drop the `Strumento` dependency and use Intonato directly;
+see the migration table in Intonato's README.
 
-**The substrate stands alone (v0.2):** the dependency edge on Intonato (the loop
-chassis ABOVE this layer) is inverted — this package no longer depends on or reexports
-Intonato. The closed-loop seam — `StrumentoBackend` / `StrumentoExperiment` —
-relocated to Intonato (≥ its next release, which depends on this package); the
-instrument layer no longer knows the calibration loop.
-
-**Dependency-light by construction (issue #16):** the base package carries only the
-contract surface — the `AbstractSoc` abstraction and its verbs (the waveform family
-`execute!`/`acquire` AND the slow-DC control class `set_gate!`/`get_gate`/`gate_snapshot`
-— gate voltages are CONTROLS, the autotuner's actions, never truth and never waveforms),
-the `QickChannelMap` device policy, the `DCAxisMap` DC wiring, readout conversion, the
-`QickProgram` translation record — plus the twin core, over stdlib and light deps only. Piccolo and PythonCall are package
-*extensions* (weakdeps): the Piccolo-triggered extension (`StrumentoPiccoloExt`)
-carries the mock soc and the pulse → QICK-envelope translation; the
-PythonCall-triggered extension (`StrumentoPythonCallExt`) carries the Python
-delegation soc. Function verbs the base declares duck-typed (`pulse_to_envelopes`,
-the pulse-sampling seam) gain their typed Piccolo methods when the extension loads;
-extension-defined *types* (`MockSoc`, `StrumentoSoc`) are reachable through
-`Base.get_extension(Strumento, …)` once loaded. Consumers that never load the
-trigger deps get the light package by construction — a sysimage, the board, a
-twin-light consumer.
-
-**Digital twins (absorbed from harmoniqs/Sosia.jl, spec-20260803-043304):** the
-twin core — drift processes (OU with the exact Gaussian transition, ramp, random
-telegraph, scheduled jumps; `DriftPlan` composition), the vault twin-record loader
-(`TwinRecord` / `load_record` / `RecordError`), and the `DigitalTwin` truth/belief/
-record contract (`instantiate`, `believed`, `advance!`, `calibrate!`). Twin records
-are vault documents: code loads records, it never owns parameters.
+The 0.3 extension-defined types `MockSoc` and `TwinSoc` are exported directly (the
+`Base.get_extension(Strumento, :StrumentoPiccoloExt)` reach no longer works — the
+extensions are gone). The twin job server, wire client, bring-up procedures,
+certification gates and Python bring-up bridge were removed, not migrated.
 """
 module Strumento
 
-using TestItems
+# The soc substrate — the contract + verbs, the channel map, the slow-DC control
+# class, the translation record + verb, readout conversion, the mock soc.
+using Intonato:
+    AbstractSoc,
+    execute!, load_envelope!, play_program!, acquire, dac_rate, adc_rate,
+    set_gate!, get_gate, gate_snapshot,
+    QickChannelMap, QickGenChannel,
+    DCAxis, DCAxisMap, gate_names, axis_for,
+    pulse_to_envelopes, QickProgram,
+    iq_to_measurements, Measurement,
+    MockSoc
 
-# ──── SoC abstraction ────────────────────────────────────────────────────────
-include("soc.jl")
-include("channel_map.jl")
-include("dc.jl")
+# The twin core, the twin wiring map, and the twin's soc face.
+using Intonato.Twins:
+    TwinWiringMap, TwinGenWiring, wiring_for,
+    DriftProcess, OrnsteinUhlenbeck, step!,
+    Ramp, RandomTelegraph, JumpSchedule, DriftPlan, apply,
+    DigitalTwin, instantiate, believed, advance!, calibrate!,
+    TwinRecord, RecordError, load_record,
+    TwinSoc
 
-# ──── Pulse / readout translation ────────────────────────────────────────────
-# The QickProgram data contract + the duck-typed translation verb live in base;
-# the AbstractPulse sampling method rides the Piccolo extension.
-include("translate.jl")
-include("readout.jl")
-
-# ──── Digital twins (absorbed from harmoniqs/Sosia.jl) ──────────────────────
-# Drift processes, the vault twin-record loader, and the truth/belief/record
-# contract (vault spec-20260803-043304-digital-twins-sosia). Twin records are
-# vault documents: code loads records, it never owns parameters.
-include("twin_drift.jl")
-include("twin_records.jl")
-include("twin.jl")
-
-# ──── Exports ────────────────────────────────────────────────────────────────
-# Base carries the soc contract, the channel map, the readout + translation
-# data contracts, and the twin core — every name below is loadable WITHOUT any
-# trigger dep (the translation verb errors actionably until the Piccolo
-# extension adds its typed method). The extension-defined TYPES — MockSoc
-# (Piccolo extension), StrumentoSoc (PythonCall extension) — are reached
-# through Base.get_extension once the trigger loads: extension exports do not
-# surface on the parent module.
 export AbstractSoc
 export execute!, load_envelope!, play_program!, acquire, dac_rate, adc_rate
 export set_gate!, get_gate, gate_snapshot
 export QickChannelMap, QickGenChannel
 export DCAxis, DCAxisMap, gate_names, axis_for
-export TwinWiringMap, TwinGenWiring, wiring_for
 export pulse_to_envelopes, QickProgram
 export iq_to_measurements, Measurement
+export MockSoc
+
+export TwinWiringMap, TwinGenWiring, wiring_for
+export DriftProcess, OrnsteinUhlenbeck, step!
+export Ramp, RandomTelegraph, JumpSchedule, DriftPlan, apply
+export DigitalTwin, instantiate, believed, advance!, calibrate!
+export TwinRecord, RecordError, load_record
+export TwinSoc
+
+const MIGRATION_URL = "https://github.com/harmoniqs/Intonato.jl#migrating-from-strumentojl"
+
+function __init__()
+    # Not at precompile time: a dependent package precompiling against the shim
+    # must not print the warning into its precompile log.
+    ccall(:jl_generating_output, Cint, ()) == 1 && return
+    @warn "Strumento.jl is deprecated and archived; use Intonato ≥ 0.5 (soc substrate at top level, twin in Intonato.Twins, StrumentoSoc via the IntonatoPythonCallExt extension). See $MIGRATION_URL" maxlog = 1
+end
 
 end # module Strumento

@@ -23,13 +23,13 @@ jobs:
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v2
-      # No Python step: the mock path runs pure-Julia. Piccolo and PythonCall
-      # are weakdeps (extension triggers; issue #16) injected into the test
-      # env by the [targets] `test` entry, so Pkg.test runs the full
-      # configuration here. PythonCall's interpreter is initialized lazily
-      # and never touched by the test suite (StrumentoSoc is not constructed
-      # in CI). The base-only / single-trigger configurations are checked
-      # locally by test/configurations/load_config_check.jl.
+      # TODO(issue #39): REMOVE this step together with the [sources] entry in
+      # Project.toml once Intonato 0.5.0 is registered. Until then the shim's
+      # Intonato dependency resolves from a sibling path checkout of the
+      # unregistered 0.5.0 branch (registered packages must not carry path
+      # sources, so neither survives registration).
+      - name: Check out unregistered Intonato 0.5 (temporary [sources] path)
+        run: git clone --depth 1 --branch amico/issue-53-retire-strumento https://github.com/harmoniqs/Intonato.jl "$GITHUB_WORKSPACE/../Intonato-retire-strumento"
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
         with:

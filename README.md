@@ -1,193 +1,79 @@
-# Strumento.jl
+# Strumento.jl — deprecated and archived
 
-The Julia face of the [**strumento**](https://github.com/harmoniqs/strumento) QICK
-tProc-v2 experiment framework — the standalone substrate layer (the soc registry:
-real/mock/twin boards).
+> [!WARNING]
+> **Strumento.jl is retired.** Its soc substrate and digital-twin core moved into
+> [Intonato.jl](https://github.com/harmoniqs/Intonato.jl) **0.5**, and its Python-duplicating
+> layers were removed in favour of using Python [`strumento`](https://github.com/harmoniqs/strumento)
+> directly. v0.4.0 is a **deprecation shim**: it depends only on Intonato, re-exports the 0.3
+> base names bound to Intonato's own objects (identity, not copies), and warns once on load.
+> Drop the `Strumento` dependency and use Intonato. See Intonato's
+> [Migrating from Strumento.jl](https://github.com/harmoniqs/Intonato.jl#migrating-from-strumentojl)
+> section.
 
-> Renamed from `IntonatoQICK.jl` on Jul 23, 2026 (the old repo is archived). The package's
-> job narrowed to "hand a solved pulse to `strumento`, get measurements back," so the name
-> follows: it is the Julia binding to `strumento`, not an Intonato-specific QICK translator.
-> Since v0.2 (issue #14) the dependency edge is inverted: this package stands alone on
-> [Piccolo](https://github.com/harmoniqs/Piccolo.jl) and no longer depends on or reexports
-> Intonato — the closed-loop seam (`StrumentoBackend` / `StrumentoExperiment`) relocated to
-> [Intonato](https://github.com/harmoniqs/Intonato.jl) (≥ its next release, which depends on
-> this package). Since the weakdeps split (issue #16), Piccolo and PythonCall are package
-> **extensions** (weakdeps): the base package is the light contract surface (the soc
-> abstraction, the channel map, readout conversion, the `QickProgram` translation record,
-> the twin core) and carries neither the physics stack nor the Python bridge. Every function
-> verb on today's surface stays base-declared and dispatches to the extension's typed
-> methods when the trigger loads; the extension-defined *types* (`MockSoc`,
-> `StrumentoSoc`) are reached through `Base.get_extension` (extension exports do not surface
-> on the parent module). Consumers that never load the trigger deps get the light package by
-> construction.
+## Migration table
 
-## One source of truth (why a *face*, not a port)
+| Strumento.jl 0.3 | New home (Intonato ≥ 0.5) |
+|---|---|
+| `AbstractSoc`, `execute!`, `load_envelope!`, `play_program!`, `acquire`, `dac_rate`, `adc_rate` | `Intonato` (same names) |
+| `set_gate!`, `get_gate`, `gate_snapshot`, `DCAxis`, `DCAxisMap`, `gate_names`, `axis_for` | `Intonato` |
+| `QickChannelMap`, `QickGenChannel`, `pulse_to_envelopes`, `QickProgram`, `iq_to_measurements` | `Intonato` |
+| `Measurement` | `Intonato.Measurement` (one `Measurement` type) |
+| `MockSoc` (via `Base.get_extension(Strumento, :StrumentoPiccoloExt)`) | `Intonato.MockSoc` |
+| `DriftProcess`, `OrnsteinUhlenbeck`, `step!`, `Ramp`, `RandomTelegraph`, `JumpSchedule`, `DriftPlan`, `apply` | `Intonato.Twins` |
+| `DigitalTwin`, `instantiate`, `believed`, `advance!`, `calibrate!`, `TwinRecord`, `RecordError`, `load_record` | `Intonato.Twins` |
+| `TwinWiringMap`, `TwinGenWiring`, `wiring_for` | `Intonato.Twins` |
+| `TwinSoc` (via `Base.get_extension(Strumento, :StrumentoPiccoloExt)`) | `Intonato.Twins.TwinSoc` |
+| `read_charge_sensor`, `charge_sensor_sweep`, `bosonic_system_builder`, `bosonic_ancilla_populations`, `spin_landscape_builder`, `DoubleDotLandscape` (Piccolo extension) | `Intonato.Twins` (not re-exported by the shim) |
+| `StrumentoSoc`, `StrumentoDCSource` (PythonCall extension) | `Base.get_extension(Intonato, :IntonatoPythonCallExt)` (not re-exported by the shim) |
 
-The device model, the pulse IR, the compiler, and `AveragerProgramV2` assembly all live in
-the Python `strumento` package. Strumento.jl is a **binding**, not a reimplementation — there
-is one authority for the pulse to program to acquire path, in Python, and two idiomatic front
-doors (Python and Julia) onto it. On a real board, Julia never assembles a program: it hands
-the solved pulse to `strumento.from_solution` over
-[PythonCall](https://github.com/JuliaPy/PythonCall.jl) and reads measurements back.
+**What the shim exports.** Every name in the first nine rows of the table is exported from
+`Strumento` as the *same object* as its Intonato / `Intonato.Twins` binding
+(`Strumento.MockSoc === Intonato.MockSoc`). `MockSoc` and `TwinSoc` are exported directly.
+The 0.3 route through `Base.get_extension(Strumento, …)` **no longer works**, because the
+shim has no extensions. It now returns `nothing`.
 
-## What it provides
+## Deleted layers (not migrated)
 
-- **`AbstractSoc`** and its verbs (`execute!`, `dac_rate`, `adc_rate`) — the board-controller
-  abstraction every soc implements.
-- **`MockSoc`** *(the Piccolo extension — reached via
-  `Base.get_extension(Strumento, :StrumentoPiccoloExt)`)* — a pure-Julia "board" that
-  translates the pulse in Julia and rolls it through a known `QuantumSystem`
-  (Piccolo-native propagation), emitting synthetic IQ. The mock path runs and is tested
-  with **no Python and no hardware**.
-- **`StrumentoSoc`** *(the PythonCall extension — reached via
-  `Base.get_extension(Strumento, :StrumentoPythonCallExt)`)* — the real board, reached by
-  **delegating to Python `strumento`** over
-  PythonCall (lazy import; only on a board). `execute!` hands the pulse to
-  `from_solution` then `StrumentoProgram` then `acquire` then `reduce`; the exact device
-  wiring / drive-map / reduce conventions are finalized with the QICK collaboration on hardware.
-- **`QickChannelMap`** (device policy the mock uses: drive to gen-channel/carrier/IQ),
-  **`pulse_to_envelopes`** (pulse → QICK-shaped envelopes, with the 16,384-sample
-  envelope-memory cap — base-declared verb; the `AbstractPulse` method rides the Piccolo
-  extension), and **`iq_to_measurements`** (IQ blob → `Measurement` via a
-  caller-supplied discriminator) — the substrate-side translation and readout surface.
-- **Digital twins** (absorbed from [`Sosia.jl`](https://github.com/harmoniqs/Sosia.jl),
-  vault spec-20260803-043304) — the twin core: drift processes
-  (`OrnsteinUhlenbeck` with the exact Gaussian transition, `Ramp`, `RandomTelegraph`,
-  `JumpSchedule`, composed per parameter via `DriftPlan`), the vault twin-record
-  loader (`load_record` → `TwinRecord`; records are vault documents — code loads
-  records, it never owns parameters), and the `DigitalTwin` truth/belief/record
-  contract (`instantiate`, `believed`, `advance!`, `calibrate!` — drift moves truth
-  only, calibration moves belief only). Seeded replay is bit-exact: a calibration
-  failure reproduces exactly.
+These layers duplicated the Python `strumento` stack. They are deleted and **not exported**
+anywhere:
 
-```julia
-using Strumento
+- **Twin job server** (`StrumentoJobServerExt`: `TwinJobServer`, the wire codec and client).
+- **Bring-up procedures and rehearsal rig** (`StrumentoBringupExt`: `RehearsalRig`,
+  `wire_address`, `stop!`, `ResonatorSweepDesign`, `comb_geometry`, `BringupSchedule`,
+  `BringupJob`, `BringupResult`, `ResonatorSweepFit`, `propose`, `run_over_wire`,
+  `write_back!`, `run_resonator_sweep`, `fixture_comb_jobs`, `RabiSweepDesign`, `rabi_axis`,
+  `rabi_geometry`, `RabiSchedule`, `RabiJob`, `RabiResult`, `RabiSweepFit`, `propose_rabi`,
+  `run_rabi_over_wire`, `run_rabi_sweep`, `fixture_rabi_job`).
+- **Certification gates** (`BosonicCertDesign`, `BosonicCertResult`, `BosonicCalibration`,
+  `BosonicTransferResult`, `certify_parameter_recovery`, `certify_calibration_transfer`,
+  `estimate_readout_confusion`, `calibration_transfer_metric`, and `docs/certification.md`).
+- **Python bring-up bridge** (`BringupBridge`, PythonCall extension).
 
-twin = instantiate("model-of-lab/stanford-bosonic.md";
-                   drift = DriftPlan(:chi_kHz => [OrnsteinUhlenbeck(theta = 0.07, sigma = 3.0, mu = -300.0)]),
-                   seed = 0xC0FFEE)
-advance!(twin, 1.0)     # drift the truth one day (belief untouched)
-believed(twin)          # what calibration currently knows
-calibrate!(twin, Dict("chi_kHz" => twin.truth[:chi_kHz]))   # write-back (truth untouched)
-```
+Their ideas were re-filed against Python `strumento`:
 
-## The division of labour
+- [harmoniqs/strumento#2](https://github.com/harmoniqs/strumento/issues/2) covers **bring-up
+  orchestration** (resonator, then Rabi, then the π reference) over `SimulatorSoc` /
+  `JobServerSoc`. It includes fit-recovery gates and calibration-store write-back, and it
+  replaces the bring-up rig, the job-server wire, the certification gates and the bridge.
+- [harmoniqs/strumento#1](https://github.com/harmoniqs/strumento/issues/1) covers
+  **time-varying truth**, meaning seeded drift processes on `SimulatorSoc`. This is the twin's
+  drift idea, made available on the Python simulator path. The Julia twin itself lives on in
+  `Intonato.Twins`.
 
-```
-Intonato (Julia)   ->  QILC chassis + StrumentoBackend / StrumentoExperiment  (the loop)
-  Strumento.jl     ->  AbstractSoc registry: MockSoc / StrumentoSoc           <- this package (the substrate)
-    StrumentoSoc   ->  PythonCall -> Python strumento  (from_solution -> compile -> acquire -> reduce)
-      strumento    ->  device model . pulse IR . compiler . program     (the authority)
-        board
-```
-
-Intonato (the loop chassis) sits **above** this package and depends on it; the substrate
-is loadable without the control stack, the physics stack, or the Python bridge — the
-extensions attach exactly when their trigger deps (`Piccolo`, `PythonCall`) load, every
-base verb dispatches through, and the extension types are one
-`Base.get_extension` away, while a sysimage or a twin-light consumer loads only the
-light base. The pure-Julia `MockSoc` short-circuits the bottom rungs
-with a `QuantumSystem` rollout (Piccolo `rollout`), so the soc contract is exercised
-board-free.
-
-## Usage (mock)
+## Using the shim (transitional only)
 
 ```julia
-using Strumento, Piccolo
-
-# The mock type is extension-defined (extension exports do not surface on the
-# parent module) — reach it through its canonical handle:
-using Strumento: Strumento
-MockSoc = Base.get_extension(Strumento, :StrumentoPiccoloExt).MockSoc
-
-# True device dynamics the "board" has (here with a model mismatch):
-sys_true = QuantumSystem(1.1 * σz, [σx], [1.0])
-soc = MockSoc(sys_true, ψ_init, ψ_goal; dac_rate = 80.0)
-
-map = QickChannelMap([QickGenChannel(0, 5e9; i_drive = 1)]; n_drives = 1)
-
-# Translate + play + read: raw per-knot IQ blobs (default forward model:
-# populations, packed complex — invert with `real`).
-raw = execute!(soc, pulse, map, [N])
-
-# Or convert to measurements with a discriminator:
-ms = iq_to_measurements(raw, b -> real.(b), [N])
+using Strumento   # ┌ Warning: Strumento.jl is deprecated and archived; use Intonato ≥ 0.5 …
+Strumento.MockSoc === Intonato.MockSoc   # true
 ```
 
-Closing the loop (upload/trigger/readout through `StrumentoBackend`, wrapping the soc as a
-`HardwareExperiment` for `PulseTuningProblem`) is the Intonato-side seam — see Intonato ≥
-its next release.
-
-On a real board, swap `MockSoc` for a `StrumentoSoc` pointed at a `strumento` device instance:
+Prefer:
 
 ```julia
-soc = StrumentoSoc("devices/multimode_demo/device.yaml";
-                   drive_map = [(1, "qubit", "drive", 4000.0)],   # (drive index, line, role, carrier MHz)
-                   dac_rate = 9.6e9, adc_rate = 2.4576e9, board = pyqicksoc)
+using Intonato                 # soc substrate, MockSoc
+using Intonato.Twins           # DigitalTwin, drift processes, TwinSoc, …
 ```
 
-## The twin job server (D14 wire contract)
+## License
 
-With `Piccolo` **and** `JSON` loaded, the `StrumentoJobServerExt` extension attaches and
-the twin becomes a **board**: it speaks the Python stack's D14 wire contract — the
-`CompiledJob` wire form (qick's own `dump_prog()` dict serialized through `NpEncoder`)
-in, the `RawAcquisition` wire form out — so "swapping twin → real device is a registry-id
-change".
-
-```
-Python strumento   ->  CompiledJob.to_wire()   ->  TwinJobServer (HTTP/JSON)  ->  RawAcquisition
-  (build+compile)        {overlay_id, program,       read → envelope-level          {"iq": [(n_reads,
-                          acquire}                    translate → twin face          [expts,] 2) per
-                                                      → shape per acquire            channel, lists]
-```
-
-- **The boundary, explicit**: the twin models the DEVICE response at the **envelope
-  level** — the envelope pages, the wave-table assignments, the CloseLoop sweep ladder's
-  literal per-expt steps (read as static data, anchored inside the expts loop), the
-  declared loop structure, the acquire block — and **never** interprets the tProc program
-  (register semantics, trigger scheduling, branching: the assembly-faithful lane is
-  Python `SimulatorSoc`'s; the two lanes are complementary — a rehearsal claim runs at
-  the envelope level, where the physics lives).
-- **The queue is the reference agent's shape** (`strumento`'s `examples/jobserver/`):
-  submit enqueues FIFO, a poll is the single worker's turn, the status dicts are
-  `pending` / `done` + acquisition / `error` + message, a failed job never takes the
-  server down, and the declared acquire shape is refused on mismatch (the one place a
-  dumb executor is picky).
-- **The HTTP layer is stdlib** (`Sockets`): two routes — `POST /jobs`,
-  `GET /jobs/<id>` (unknown ids 404) — one request per connection; no package dependency
-  edge.
-- **The server is a soc-level actor** over one `TwinSoc`: the drift advances ACROSS jobs
-  (its own clock, `dt` per job; the soc's per-acquire `dt` stays 0) — job *k* measures
-  truth aged `(k-1)·dt`, which is the rehearsal point.
-- **Conventions** (documented in `execute_job`'s docstring): quantum time in ns
-  (`dac_rate = fs` in samples per ns), the v1 amplitude scale (a full-scale DAC drive is
-  1.0 family unit; a calibrated rad/ns-per-full-scale mapping is future record surface),
-  and the sweep axis realized from the declared loop structure — the IQ-trend evidence
-  rides the committed real-span fixture.
-
-## Data-provenance note
-
-`StrumentoBackend`'s `last_raw` stash and the `ExperimentRecord` logging discussion moved
-with the seam to Intonato (its QILC chassis calls `run_experiment` with no logger today;
-full raw-IQ-into-record provenance during closed-loop runs is a planned Intonato
-enhancement).
-
-## Status
-
-Interface-complete with a tested pure-Julia mock suite. The real-board `StrumentoSoc`
-delegation path is validated with the QICK collaboration on hardware (it needs the Python
-`strumento` package + a board and is not exercised in CI). The twin core (drift, records,
-truth/belief contract) is absorbed from Sosia.jl (issue #15); the twin's soc face
-(`TwinSoc`, issues #20/#23) and the bosonic family factory — the dispersive
-transmon-ancilla–cavity system with Lindblad decay, from the twin's current truth
-(issue #21) — ride the Piccolo extension, which also rolls `OpenQuantumSystem` family
-builders through the Lindblad master equation. Family physics factories for the other
-families (transmon, spin, atoms) ride the Piccolo extension; the twin job server — the
-D14 wire contract (`CompiledJob` in, `RawAcquisition` out) over HTTP/JSON, the envelope
-level, the queue + stdlib HTTP layer — landed with issue #29 (the `StrumentoJobServerExt`
-extension, `Piccolo` + `JSON` triggers).
-Calibration routines and multi-board orchestration remain out of scope. The
-weakdeps/extensions split (issue #16) is done: Piccolo and PythonCall are package
-extensions — the base package (contract + twins) loads in an environment with neither,
-checked by `test/configurations/load_config_check.jl`; `Pkg.test()` still runs the full
-configuration (both triggers ride the test target).
+MIT — see [LICENSE](LICENSE).

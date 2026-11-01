@@ -9,15 +9,6 @@ version = "0.4.0"
 [deps]
 Intonato = "4c8581c7-0eaf-45eb-b8fa-a3474c50779c"
 
-# TODO(issue #39): REMOVE this [sources] entry before registering v0.4.0 —
-# registered packages must not carry path sources. It exists only because
-# Intonato 0.5.0 (harmoniqs/Intonato.jl branch amico/issue-53-retire-strumento)
-# is not registered yet; once it is, delete this block (and the matching
-# "unregistered Intonato" step in .github/workflows/CI.yml) and resolve
-# Intonato from General.
-[sources]
-Intonato = {path = "../Intonato-retire-strumento"}
-
 [compat]
 Intonato = "0.5"
 Test = "1.11"
